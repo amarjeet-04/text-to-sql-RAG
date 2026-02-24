@@ -39,6 +39,15 @@ export interface QueryResponse {
   from_cache: boolean;
   error: string | null;
   nl_pending?: boolean;
+  timing?: Record<string, number> | null;
+  request_id?: string | null;
+}
+
+export interface NLStatusResponse {
+  request_id: string;
+  status: 'pending' | 'ready' | 'error' | 'not_found';
+  nl_answer: string | null;
+  error: string | null;
 }
 
 export interface ChatEntry {

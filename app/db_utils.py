@@ -3,16 +3,21 @@ Database Utilities - Timeout, View Support, and Safe Query Execution
 """
 import re
 import signal
-import threading
+import os
+import time
+import logging
 from typing import Optional, List, Tuple, Any
 from functools import wraps
 from dataclasses import dataclass
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 import pandas as pd
 from sqlalchemy import create_engine, text, event
 from sqlalchemy.engine import Engine
 from langchain_community.utilities import SQLDatabase
+
+logger = logging.getLogger("db_utils")
 
 
 @dataclass
@@ -130,33 +135,32 @@ def query_timeout_context(seconds: int):
         with query_timeout_context(30):
             result = execute_query(...)
     """
-    result = [None]
-    exception = [None]
-    completed = threading.Event()
-
-    def target(func, args, kwargs):
-        try:
-            result[0] = func(*args, **kwargs)
-        except Exception as e:
-            exception[0] = e
-        finally:
-            completed.set()
-
     class TimeoutContext:
         def run(self, func, *args, **kwargs):
-            thread = threading.Thread(target=target, args=(func, args, kwargs))
-            thread.daemon = True
-            thread.start()
-
-            if not completed.wait(timeout=seconds):
-                raise QueryTimeoutError(f"Query exceeded {seconds} second timeout")
-
-            if exception[0]:
-                raise exception[0]
-
-            return result[0]
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(func, *args, **kwargs)
+                try:
+                    return future.result(timeout=seconds)
+                except FuturesTimeoutError as exc:
+                    future.cancel()
+                    raise QueryTimeoutError(f"Query exceeded {seconds} second timeout") from exc
 
     yield TimeoutContext()
+
+
+def _is_transient_operational_error(error_text: str) -> bool:
+    text_low = (error_text or "").lower()
+    transient_signals = (
+        "timeout",
+        "timed out",
+        "could not connect",
+        "connection reset",
+        "connection is busy",
+        "deadlock victim",
+        "transport-level error",
+        "communication link failure",
+    )
+    return any(sig in text_low for sig in transient_signals)
 
 
 def execute_query_safe(
@@ -179,67 +183,85 @@ def execute_query_safe(
     """
     import sqlalchemy
 
-    # Add TOP N row cap only when the query has no row limit already.
-    # We check both the outer SELECT and — for CTE/WITH queries — the final
-    # SELECT that follows the last closing parenthesis, so we never inject
-    # TOP N inside a CTE body where it would be a syntax error.
     query_stripped = query.rstrip().rstrip(';')
     query_upper = query_stripped.upper()
-    has_top = "TOP " in query_upper
-    # Locate the final SELECT statement (after any CTE block)
-    last_select_pos = query_upper.rfind("SELECT")
-    is_cte = query_upper.lstrip().startswith("WITH")
-    if not has_top:
-        if not is_cte and query_upper.lstrip().startswith("SELECT"):
-            # Simple SELECT — inject directly after SELECT keyword
-            if not ("COUNT(*)" in query_upper and "GROUP BY" not in query_upper):
-                query_stripped = re.sub(
-                    r'(?i)^SELECT\b',
-                    f'SELECT TOP {max_rows}',
-                    query_stripped,
-                    count=1,
-                )
-        elif is_cte and last_select_pos != -1:
-            # CTE query — inject TOP N into the final outer SELECT only
-            before = query_stripped[:last_select_pos]
-            after = query_stripped[last_select_pos:]
-            after = re.sub(r'(?i)^SELECT\b', f'SELECT TOP {max_rows}', after, count=1)
-            query_stripped = before + after
 
-    try:
-        engine = db._engine
+    engine = db._engine
+    dialect = (getattr(getattr(engine, "dialect", None), "name", "") or "").lower()
+    if "mssql" in dialect:
+        # Add TOP N row cap only when the query has no row limit already.
+        # We check both the outer SELECT and — for CTE/WITH queries — the final
+        # SELECT that follows the last closing parenthesis, so we never inject
+        # TOP N inside a CTE body where it would be a syntax error.
+        has_top = "TOP " in query_upper
+        last_select_pos = query_upper.rfind("SELECT")
+        is_cte = query_upper.lstrip().startswith("WITH")
+        if not has_top:
+            if not is_cte and query_upper.lstrip().startswith("SELECT"):
+                if not ("COUNT(*)" in query_upper and "GROUP BY" not in query_upper):
+                    query_stripped = re.sub(
+                        r"(?i)^SELECT\b",
+                        f"SELECT TOP {max_rows}",
+                        query_stripped,
+                        count=1,
+                    )
+            elif is_cte and last_select_pos != -1:
+                before = query_stripped[:last_select_pos]
+                after = query_stripped[last_select_pos:]
+                after = re.sub(r"(?i)^SELECT\b", f"SELECT TOP {max_rows}", after, count=1)
+                query_stripped = before + after
+    else:
+        # Non-SQL Server fallback for tests/local tooling.
+        has_limit = re.search(r"(?i)\bLIMIT\s+\d+\b", query_stripped) is not None
+        if not has_limit and not re.search(r"(?i)\bCOUNT\s*\(\s*\*\s*\)", query_stripped):
+            query_stripped = query_stripped.rstrip() + f" LIMIT {max_rows}"
 
-        with engine.connect() as conn:
-            result_proxy = conn.execute(text(query_stripped))
-            columns = list(result_proxy.keys())
-            # fetchmany in chunks avoids materialising the full result set
-            # in one blocking call — the driver returns control sooner for
-            # large result sets and keeps peak memory lower.
-            chunk_size = 500
-            rows: list = []
-            while True:
-                chunk = result_proxy.fetchmany(chunk_size)
-                if not chunk:
-                    break
-                rows.extend(chunk)
-                if len(rows) >= max_rows:
-                    rows = rows[:max_rows]
-                    break
+    max_retries = max(0, int(os.getenv("DB_TRANSIENT_RETRIES", "1")))
+    base_backoff = max(0.05, float(os.getenv("DB_TRANSIENT_RETRY_BACKOFF_SECONDS", "0.2")))
 
-        if rows:
-            df = pd.DataFrame(rows, columns=columns)
-            return df, None
-        else:
+    attempt = 0
+    while True:
+        try:
+            with engine.connect() as conn:
+                result_proxy = conn.execute(text(query_stripped))
+                columns = list(result_proxy.keys())
+                # fetchmany in chunks avoids materialising the full result set
+                # in one blocking call — the driver returns control sooner for
+                # large result sets and keeps peak memory lower.
+                chunk_size = 500
+                rows: list = []
+                while True:
+                    chunk = result_proxy.fetchmany(chunk_size)
+                    if not chunk:
+                        break
+                    rows.extend(chunk)
+                    if len(rows) >= max_rows:
+                        rows = rows[:max_rows]
+                        break
+
+            if rows:
+                df = pd.DataFrame(rows, columns=columns)
+                return df, None
             return pd.DataFrame(), None
-
-    except sqlalchemy.exc.OperationalError as e:
-        error_str = str(e)
-        if "timeout" in error_str.lower() or "cancelled" in error_str.lower():
-            return None, f"Query timed out after {timeout_seconds} seconds. Try a more specific query."
-        return None, f"Database error: {error_str}"
-
-    except Exception as e:
-        return None, f"Query execution failed: {str(e)}"
+        except sqlalchemy.exc.OperationalError as e:
+            error_str = str(e)
+            if attempt < max_retries and _is_transient_operational_error(error_str):
+                delay = round(base_backoff * (2 ** attempt), 3)
+                logger.warning(
+                    "transient_db_error retrying attempt=%s max=%s delay=%ss error=%s",
+                    attempt + 1,
+                    max_retries,
+                    delay,
+                    error_str[:180],
+                )
+                time.sleep(delay)
+                attempt += 1
+                continue
+            if "timeout" in error_str.lower() or "cancelled" in error_str.lower():
+                return None, f"Query timed out after {timeout_seconds} seconds. Try a more specific query."
+            return None, f"Database error: {error_str}"
+        except Exception as e:
+            return None, f"Query execution failed: {str(e)}"
 
 
 def validate_sql_dry_run(db: SQLDatabase, query: str) -> Tuple[bool, Optional[str]]:
@@ -253,6 +275,10 @@ def validate_sql_dry_run(db: SQLDatabase, query: str) -> Tuple[bool, Optional[st
 
     try:
         engine = db._engine
+        dialect = (getattr(getattr(engine, "dialect", None), "name", "") or "").lower()
+        if "mssql" not in dialect:
+            # NOEXEC is SQL Server specific; don't block execution for other dialects.
+            return True, None
         with engine.connect() as conn:
             conn.execute(text("SET NOEXEC ON"))
             try:
@@ -265,6 +291,10 @@ def validate_sql_dry_run(db: SQLDatabase, query: str) -> Tuple[bool, Optional[st
             finally:
                 try:
                     conn.execute(text("SET NOEXEC OFF"))
+                except Exception:
+                    pass
+                try:
+                    conn.rollback()
                 except Exception:
                     pass
     except Exception as e:

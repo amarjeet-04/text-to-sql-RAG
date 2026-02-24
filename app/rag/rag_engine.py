@@ -1,669 +1,328 @@
 """
-RAG Engine - Retrieves relevant schema context for SQL generation
-Supports FAISS (default) and Pinecone for vector search.
-"""
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass
-import re
-import os
-import hashlib
-import time
+### FAST RAG
+FAISS-only in-memory RAG engine with TTL-cached retrieval results.
+Pinecone support removed — FAISS is sufficient for the dataset size.
 
-# LangChain imports (required)
+Optimisations vs. previous version:
+  - Retrieval results cached 10 min by (normalised-question, top_k)
+  - Follow-up / sort / filter queries skip retrieval entirely
+  - Complex queries get top_k=4; simple ones get top_k=2
+  - Class-level embedder singleton (loads once per process)
+"""
+import re, os, hashlib, time, threading
+from typing import Dict, List, Optional, Any, Tuple
+from dataclasses import dataclass
+from collections import OrderedDict
+
 from langchain_core.documents import Document
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 
-try:
-    from pinecone import Pinecone, ServerlessSpec
-except Exception:
-    Pinecone = None
-    ServerlessSpec = None
+import logging
+from backend.services.runtime import log_event
+logger = logging.getLogger("rag_engine")
 
-
-
-
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
 @dataclass
 class SchemaDoc:
-    """Document in knowledge base"""
-    doc_id: str
-    doc_type: str  # table, column, example, rule, synonym
-    content: str
+    doc_id:   str
+    doc_type: str          # table | example | rule | synonym
+    content:  str
     metadata: Dict[str, Any]
 
 
+# ---------------------------------------------------------------------------
+# RAGEngine — FAISS backend only
+# ---------------------------------------------------------------------------
 class RAGEngine:
     """
-    RAG Engine for schema context retrieval.
-    Optimized for FAISS in-memory retrieval and Pinecone remote retrieval.
+    FAISS in-memory RAG engine.
 
-    Stores and retrieves:
-    - Table definitions
-    - Column descriptions
-    - Example queries (question → SQL)
-    - Business rules
-    - Synonyms/aliases
+    Retrieve flow:
+      1. Skip entirely for follow-ups / sort / filter (no value added)
+      2. Cap top_k=2 for simple queries (saves embedding time)
+      3. Hit TTL cache (10 min) by normalised question key
+      4. FAISS similarity search → keyword fallback if FAISS unavailable
     """
 
-    # Class-level cache for embedder (expensive to load)
-    _cached_embedder = None
-    _cached_model_name = None
+    # ### FAST RAG — class-level singleton embedder (loaded once per process)
+    _cached_embedder:    Any = None
+    _cached_model_name:  Optional[str] = None
+    # retrieval result cache: key → (timestamp, result_dict)
+    _retrieve_cache: "OrderedDict[str, Tuple[float, Dict]]" = OrderedDict()
+    _cache_lock = threading.RLock()
+    CACHE_TTL: int = int(os.getenv("RAG_CACHE_TTL_SECONDS", "900"))   # 15 min default
+    CACHE_MAX: int = int(os.getenv("RAG_CACHE_MAX_ENTRIES", "256"))
+
+    # Keywords that signal a complex query needing more examples
+    _COMPLEX_SIGNALS = frozenset({
+        "yoy", "ytd", "pytd", "growth", "trend", "compare", "versus",
+        "vs", "monthly", "quarterly", "yearly", "breakdown", "split",
+    })
+
+    # Prefixes / patterns that identify follow-up / filter / sort queries
+    _FOLLOWUP_PREFIXES = (
+        "what about", "how about", "only for", "filter by", "just ",
+        "and ", "show only", "same but", "now show", "drill down",
+    )
 
     def __init__(
         self,
         model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
         enable_embeddings: bool = True,
     ):
-        # Stored docs for keyword fallback and context construction
-        self.documents: List[SchemaDoc] = []
-        # Vector stores for semantic retrieval
-        self.vector_store = None
-        self.pinecone_index = None
-        self.model_name = model_name
-
-        requested_backend = os.getenv("VECTOR_BACKEND", "faiss").strip().lower()
-        self.vector_backend = requested_backend if requested_backend in {"faiss", "pinecone"} else "faiss"
-        self.pinecone_api_key = os.getenv("PINECONE_API_KEY", "").strip()
-        self.pinecone_index_name = os.getenv("PINECONE_INDEX", "text2sql-schema").strip() or "text2sql-schema"
-        self.pinecone_namespace = os.getenv("PINECONE_NAMESPACE", "default").strip() or "default"
-        self.pinecone_metric = os.getenv("PINECONE_METRIC", "cosine").strip().lower() or "cosine"
-        self.pinecone_cloud = os.getenv("PINECONE_CLOUD", "aws").strip() or "aws"
-        self.pinecone_region = os.getenv("PINECONE_REGION", "us-east-1").strip() or "us-east-1"
-
-        if self.vector_backend == "pinecone":
-            if not self.pinecone_api_key or Pinecone is None:
-                # Fall back safely if Pinecone is not configured/installed.
-                self.vector_backend = "faiss"
-
-        self.embedder = None
+        self.documents:    List[SchemaDoc] = []
+        self.vector_store: Optional[FAISS] = None
+        self.model_name                    = model_name
+        self.embedder:     Any             = None
 
         if not enable_embeddings:
             return
 
-        # Reuse cached embedder if model is the same (saves ~2-3 seconds)
-        if RAGEngine._cached_embedder is not None and RAGEngine._cached_model_name == model_name:
+        # Reuse class-level cached embedder (saves ~2-3 s startup)
+        if RAGEngine._cached_embedder and RAGEngine._cached_model_name == model_name:
             self.embedder = RAGEngine._cached_embedder
         else:
             try:
                 self.embedder = HuggingFaceEmbeddings(
                     model_name=model_name,
-                    model_kwargs={'device': 'cpu'},
-                    encode_kwargs={'normalize_embeddings': True, 'batch_size': 32}
+                    model_kwargs={"device": "cpu"},
+                    encode_kwargs={"normalize_embeddings": True, "batch_size": 32},
                 )
-                # Cache for future use
-                RAGEngine._cached_embedder = self.embedder
+                RAGEngine._cached_embedder   = self.embedder
                 RAGEngine._cached_model_name = model_name
+                logger.info("Embedder loaded: %s", model_name)
             except Exception:
-                # Graceful fallback: keep app usable even if embedding deps/model are unavailable.
+                logger.warning("Embedder unavailable — keyword fallback only", exc_info=True)
                 self.embedder = None
 
-    def _hash_doc_id(self, doc: SchemaDoc) -> str:
-        key = f"{doc.doc_id}|{doc.doc_type}|{doc.content}"
-        return hashlib.sha1(key.encode("utf-8")).hexdigest()
+    # ------------------------------------------------------------------
+    # Document ingestion helpers
+    # ------------------------------------------------------------------
+    def _doc_id(self, text: str) -> str:
+        return hashlib.md5(text.encode()).hexdigest()[:12]
 
-    def _sanitize_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
-        cleaned = {}
-        for key, value in (metadata or {}).items():
-            if value is None:
-                continue
-            if isinstance(value, (str, int, float, bool)):
-                cleaned[key] = value
-                continue
-            if isinstance(value, list):
-                items = []
-                for item in value:
-                    if isinstance(item, (str, int, float, bool)):
-                        items.append(item)
-                    elif item is not None:
-                        items.append(str(item))
-                cleaned[key] = items
-                continue
-            cleaned[key] = str(value)
-        return cleaned
-
-    def _resolve_embedding_dim(self) -> int:
-        if self.embedder is None:
-            return 0
-        vec = self.embedder.embed_query("dimension_probe")
-        return len(vec)
-
-    def _pinecone_index_exists(self, pc: Any, index_name: str) -> bool:
-        try:
-            result = pc.list_indexes()
-            if hasattr(result, "names"):
-                return index_name in result.names()
-            if isinstance(result, dict):
-                if "indexes" in result:
-                    return any(i.get("name") == index_name for i in result.get("indexes", []))
-                return index_name in result
-            return any(getattr(i, "name", None) == index_name for i in result)
-        except Exception:
-            return False
-
-    def _ensure_pinecone_index(self):
-        if self.pinecone_index is not None:
-            return
-        if Pinecone is None or not self.pinecone_api_key:
-            raise RuntimeError("Pinecone is not available. Install dependency and set PINECONE_API_KEY.")
-
-        pc = Pinecone(api_key=self.pinecone_api_key)
-        dim = self._resolve_embedding_dim()
-        if dim <= 0:
-            raise RuntimeError("Unable to resolve embedding dimension for Pinecone index.")
-
-        if not self._pinecone_index_exists(pc, self.pinecone_index_name):
-            if ServerlessSpec is None:
-                raise RuntimeError("Pinecone ServerlessSpec is unavailable in current pinecone package.")
-            pc.create_index(
-                name=self.pinecone_index_name,
-                dimension=dim,
-                metric=self.pinecone_metric,
-                spec=ServerlessSpec(cloud=self.pinecone_cloud, region=self.pinecone_region),
-            )
-            for _ in range(30):
-                try:
-                    desc = pc.describe_index(self.pinecone_index_name)
-                    ready = False
-                    if hasattr(desc, "status"):
-                        status = getattr(desc, "status")
-                        if isinstance(status, dict):
-                            ready = bool(status.get("ready", False))
-                        else:
-                            ready = bool(getattr(status, "ready", False))
-                    elif isinstance(desc, dict):
-                        ready = bool(desc.get("status", {}).get("ready", False))
-                    if ready:
-                        break
-                except Exception:
-                    pass
-                time.sleep(1)
-
-        self.pinecone_index = pc.Index(self.pinecone_index_name)
-    
-    def add_table(self, name: str, description: str, columns: List[Dict], aliases: List[str] = None):
-        """Add table with columns and optional aliases"""
-        # Main table doc
-        col_text = "\n".join([
-            f"  • {c['name']} ({c.get('type','')}) - {c.get('description','')}"
-            for c in columns
-        ])
-        
-        content = f"Table: {name}\nDescription: {description}\nColumns:\n{col_text}"
-        
-        self._add_doc(SchemaDoc(
-            doc_id=f"table_{name}",
-            doc_type="table",
-            content=content,
-            metadata={"table": name, "columns": [c["name"] for c in columns]}
-        ))
-        
-        # Add column docs
-        for col in columns:
-            self._add_doc(SchemaDoc(
-                doc_id=f"col_{name}_{col['name']}",
-                doc_type="column",
-                content=f"{col['name']} in {name}: {col.get('description', '')} (Type: {col.get('type', '')})",
-                metadata={"table": name, "column": col["name"], "type": col.get("type")}
-            ))
-        
-        # Add aliases
-        if aliases:
-            for alias in aliases:
-                self._add_doc(SchemaDoc(
-                    doc_id=f"alias_{name}_{alias}",
-                    doc_type="synonym",
-                    content=f"'{alias}' refers to {name} table. When user mentions {alias}, use {name}.",
-                    metadata={"table": name, "alias": alias}
-                ))
-    
-    def add_relationship(self, from_table: str, from_col: str, to_table: str, to_col: str):
-        """Add table relationship for JOINs"""
-        content = f"JOIN: {from_table}.{from_col} → {to_table}.{to_col}\n"
-        content += f"To connect {from_table} with {to_table}, use: "
-        content += f"{from_table} JOIN {to_table} ON {from_table}.{from_col} = {to_table}.{to_col}"
-        
-        self._add_doc(SchemaDoc(
-            doc_id=f"rel_{from_table}_{to_table}",
-            doc_type="relationship",
-            content=content,
-            metadata={"from": from_table, "to": to_table}
-        ))
-    
-    def add_example(self, question: str, sql: str, variations: List[str] = None):
-        """Add example query with variations"""
-        content = f"Question: {question}\nSQL: {sql}"
-        
-        self._add_doc(SchemaDoc(
-            doc_id=f"ex_{hash(question) % 10000}",
-            doc_type="example",
-            content=content,
-            metadata={"question": question, "sql": sql}
-        ))
-        
-        # Add variations as separate examples
-        if variations:
-            for var in variations:
-                self._add_doc(SchemaDoc(
-                    doc_id=f"ex_{hash(var) % 10000}",
-                    doc_type="example",
-                    content=f"Question: {var}\nSQL: {sql}",
-                    metadata={"question": var, "sql": sql, "is_variation": True}
-                ))
-    
-    def add_rule(self, name: str, description: str, sql_hint: str = None):
-        """Add business rule"""
-        content = f"Rule - {name}: {description}"
-        if sql_hint:
-            content += f"\nSQL: {sql_hint}"
-        
-        self._add_doc(SchemaDoc(
-            doc_id=f"rule_{name}",
-            doc_type="rule",
-            content=content,
-            metadata={"rule": name, "sql": sql_hint}
-        ))
-    
-    def add_synonym(self, term: str, means: str, context: str = None):
-        """Add term synonym/mapping"""
-        content = f"'{term}' means '{means}'"
-        if context:
-            content += f" in the context of {context}"
-        
-        self._add_doc(SchemaDoc(
-            doc_id=f"syn_{term}",
-            doc_type="synonym",
-            content=content,
-            metadata={"term": term, "means": means}
-        ))
-    
     def _add_doc(self, doc: SchemaDoc):
-        """Add document to pending list (will be indexed in batch later)"""
         self.documents.append(doc)
 
+    def add_example(self, question: str, sql: str,
+                    variations: Optional[List[str]] = None):
+        for q in [question] + (variations or []):
+            self._add_doc(SchemaDoc(
+                doc_id   = self._doc_id(q + sql),
+                doc_type = "example",
+                content  = f"Q: {q}\nSQL: {sql}",
+                metadata = {"question": q, "sql": sql, "type": "example"},
+            ))
+
+    def add_rule(self, name: str, description: str,
+                 sql_hint: Optional[str] = None):
+        content = f"RULE: {name}\n{description}"
+        if sql_hint:
+            content += f"\nSQL hint: {sql_hint}"
+        self._add_doc(SchemaDoc(self._doc_id(content), "rule", content,
+                                {"name": name, "type": "rule"}))
+
+    def add_table(self, name: str, description: str, columns: List[Dict],
+                  aliases: Optional[List[str]] = None):
+        col_str = ", ".join(c.get("name", "") for c in columns[:20])
+        content = f"TABLE: {name}\n{description}\nColumns: {col_str}"
+        if aliases:
+            content += f"\nAliases: {', '.join(aliases)}"
+        self._add_doc(SchemaDoc(self._doc_id(name + content), "table", content,
+                                {"table": name, "type": "table"}))
+
+    def add_synonym(self, term: str, means: str, context: Optional[str] = None):
+        content = f"SYNONYM: {term} → {means}"
+        if context:
+            content += f" ({context})"
+        self._add_doc(SchemaDoc(self._doc_id(content), "synonym", content,
+                                {"term": term, "type": "synonym"}))
+
+    # ------------------------------------------------------------------
+    # Index build
+    # ------------------------------------------------------------------
     def build_index(self):
-        """Build vector index from all documents in one batch."""
-        if not self.documents or self.embedder is None:
+        if not self.embedder or not self.documents:
             return
+        lc_docs = [Document(page_content=d.content, metadata=d.metadata)
+                   for d in self.documents]
+        try:
+            self.vector_store = FAISS.from_documents(lc_docs, self.embedder)
+            logger.info("FAISS index built: %d docs", len(lc_docs))
+        except Exception:
+            logger.warning("FAISS index build failed", exc_info=True)
+            self.vector_store = None
 
-        if self.vector_backend == "pinecone":
+    # ------------------------------------------------------------------
+    # ### FAST RAG — retrieval skip detection
+    # ------------------------------------------------------------------
+    def _is_followup_or_simple(self, query: str) -> bool:
+        """Return True if the query is a follow-up / filter / sort request
+        that gains nothing from RAG retrieval."""
+        q = query.lower().strip()
+        if any(q.startswith(p) for p in self._FOLLOWUP_PREFIXES):
+            return True
+        words = q.split()
+        # Very short questions are almost always contextual follow-ups
+        return len(words) <= 4
+
+    def _effective_k(self, query: str, top_k: int) -> int:
+        """Reduce top_k for simple queries to cut embedding time."""
+        words = set(re.findall(r"[a-z]+", query.lower()))
+        return top_k if (words & self._COMPLEX_SIGNALS) else min(top_k, 2)
+
+    def _cache_key(self, query: str, top_k: int, intent_key: Optional[str] = None) -> str:
+        norm = re.sub(r"\s+", " ", query.lower().strip())
+        intent = (intent_key or "").strip().lower()
+        return hashlib.md5(f"{intent}:{norm}:{top_k}".encode()).hexdigest()
+
+    # ------------------------------------------------------------------
+    # Public retrieve API
+    # ------------------------------------------------------------------
+    def retrieve(
+        self,
+        query:             str,
+        top_k:             int  = 4,
+        fast_mode:         bool = False,
+        skip_for_followup: bool = False,
+        intent_key:        Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return {examples, rules, tables} for the given query.
+
+        Args:
+            skip_for_followup: when True, short/follow-up queries return empty immediately.
+            fast_mode:         ignored (kept for API compat).
+        """
+        # ### FAST RAG — skip retrieval for follow-ups
+        if skip_for_followup and self._is_followup_or_simple(query):
+            return {"examples": [], "rules": [], "tables": [], "skipped": True}
+
+        k = self._effective_k(query, top_k)
+        cache_key = self._cache_key(query, k, intent_key=intent_key)
+
+        # ### FAST RAG — TTL cache hit
+        now = time.time()
+        with self._cache_lock:
+            cached = self._retrieve_cache.get(cache_key)
+            if cached and (now - cached[0]) < self.CACHE_TTL:
+                self._retrieve_cache.move_to_end(cache_key)
+                log_event(logger, logging.INFO, "rag_cache_hit", cache_key=cache_key, top_k=k)
+                return cached[1]
+            if cached:
+                self._retrieve_cache.pop(cache_key, None)
+
+        result = self._do_retrieve(query, k)
+
+        # Store in cache, evict oldest if over limit
+        with self._cache_lock:
+            self._retrieve_cache[cache_key] = (now, result)
+            self._retrieve_cache.move_to_end(cache_key)
+            while len(self._retrieve_cache) > self.CACHE_MAX:
+                self._retrieve_cache.popitem(last=False)
+        log_event(logger, logging.INFO, "rag_cache_miss", cache_key=cache_key, top_k=k)
+
+        return result
+
+    @classmethod
+    def clear_retrieval_cache(cls) -> None:
+        with cls._cache_lock:
+            cls._retrieve_cache.clear()
+
+    # ------------------------------------------------------------------
+    # Internal retrieval
+    # ------------------------------------------------------------------
+    def _do_retrieve(self, query: str, top_k: int) -> Dict[str, Any]:
+        if self.vector_store and self.embedder:
             try:
-                self._ensure_pinecone_index()
-                self.pinecone_index.delete(delete_all=True, namespace=self.pinecone_namespace)
-
-                batch_size = 64
-                for i in range(0, len(self.documents), batch_size):
-                    chunk = self.documents[i:i + batch_size]
-                    texts = [doc.content for doc in chunk]
-                    embeddings = self.embedder.embed_documents(texts)
-                    vectors = []
-                    for doc, emb in zip(chunk, embeddings):
-                        metadata = self._sanitize_metadata({"doc_id": doc.doc_id, "doc_type": doc.doc_type, **doc.metadata})
-                        metadata["_content"] = doc.content
-                        vectors.append({
-                            "id": self._hash_doc_id(doc),
-                            "values": emb,
-                            "metadata": metadata,
+                docs = self.vector_store.similarity_search(query, k=top_k * 2)
+                seen: set = set()
+                examples, rules, tables = [], [], []
+                for doc in docs:
+                    key = doc.page_content[:80]
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    t = doc.metadata.get("type", "")
+                    if t == "example" and len(examples) < top_k:
+                        examples.append({
+                            "question": doc.metadata.get("question", ""),
+                            "sql":      doc.metadata.get("sql", ""),
                         })
-                    self.pinecone_index.upsert(vectors=vectors, namespace=self.pinecone_namespace)
-                return
+                    elif t == "rule" and len(rules) < 2:
+                        rules.append({"name": doc.metadata.get("name", ""),
+                                      "content": doc.page_content})
+                    elif t == "table" and len(tables) < 2:
+                        tables.append({"table": doc.metadata.get("table", ""),
+                                       "content": doc.page_content})
+                return {"examples": examples, "rules": rules, "tables": tables}
             except Exception:
-                # Keep app usable if Pinecone calls fail.
-                self.vector_backend = "faiss"
-                self.pinecone_index = None
+                logger.warning("FAISS search failed, using keyword fallback", exc_info=True)
 
-        lc_docs = [
-            Document(
-                page_content=doc.content,
-                metadata={"doc_id": doc.doc_id, "doc_type": doc.doc_type, **doc.metadata}
-            )
-            for doc in self.documents
-        ]
-        self.vector_store = FAISS.from_documents(lc_docs, self.embedder)
-    
-    def retrieve(self, query: str, top_k: int = 6) -> Dict[str, Any]:
-        """
-        Retrieve relevant context for a query.
-        
-        Returns:
-            {
-                "schema_context": str,
-                "tables": List[str],
-                "examples": List[Dict],
-                "rules": List[str],
-            }
-        """
-        if not self.documents:
-            return {"schema_context": "", "tables": [], "examples": [], "rules": []}
-        
-        # Get relevant docs
-        if self.vector_store is not None or (self.vector_backend == "pinecone" and self.pinecone_index is not None):
-            docs = self._retrieve_by_embedding(query, top_k)
-        else:
-            docs = self._retrieve_by_keyword(query, top_k)
-        
-        # Organize results
-        tables = set()
-        examples = []
-        rules = []
-        schema_parts = []
-        
-        for doc in docs:
-            if doc.doc_type == "table":
-                tables.add(doc.metadata.get("table"))
-                schema_parts.append(doc.content)
-            elif doc.doc_type == "column":
-                tables.add(doc.metadata.get("table"))
-                schema_parts.append(doc.content)
-            elif doc.doc_type == "relationship":
-                schema_parts.append(doc.content)
-            elif doc.doc_type == "example":
-                examples.append({
-                    "question": doc.metadata.get("question"),
-                    "sql": doc.metadata.get("sql")
-                })
-            elif doc.doc_type == "rule":
-                rules.append(doc.content)
-            elif doc.doc_type == "synonym":
-                schema_parts.append(doc.content)
+        return self._keyword_retrieve(query, top_k)
 
-        # Fallback: ensure we always return some schema context
-        if not schema_parts:
-            for doc in self.documents:
-                if doc.doc_type == "table":
-                    tables.add(doc.metadata.get("table"))
-                    schema_parts.append(doc.content)
-                if len(schema_parts) >= 2:
-                    break
+    def _keyword_retrieve(self, query: str, top_k: int) -> Dict[str, Any]:
+        q_words = set(re.findall(r"[a-z]+", query.lower()))
+        scored = sorted(
+            [(len(q_words & set(re.findall(r"[a-z]+", d.content.lower()))), d)
+             for d in self.documents],
+            key=lambda x: -x[0],
+        )
+        examples = [
+            {"question": d.metadata.get("question", ""),
+             "sql":      d.metadata.get("sql", "")}
+            for sc, d in scored
+            if sc > 0 and d.doc_type == "example"
+        ][:top_k]
+        return {"examples": examples, "rules": [], "tables": []}
 
-        return {
-            "schema_context": "\n\n".join(schema_parts),
-            "tables": list(tables),
-            "examples": examples[:3],
-            "rules": rules
-        }
-    
-    def _retrieve_by_embedding(self, query: str, top_k: int) -> List[SchemaDoc]:
-        """Semantic similarity retrieval using Pinecone or FAISS."""
-        if self.vector_backend == "pinecone" and self.pinecone_index is not None and self.embedder is not None:
-            try:
-                query_vec = self.embedder.embed_query(query)
-                response = self.pinecone_index.query(
-                    vector=query_vec,
-                    top_k=top_k,
-                    include_metadata=True,
-                    namespace=self.pinecone_namespace,
-                )
-                matches = getattr(response, "matches", None)
-                if matches is None and isinstance(response, dict):
-                    matches = response.get("matches", [])
-                mapped = []
-                for match in matches or []:
-                    metadata = getattr(match, "metadata", None)
-                    if metadata is None and isinstance(match, dict):
-                        metadata = match.get("metadata", {}) or {}
-                    metadata = dict(metadata or {})
-                    content = metadata.pop("_content", "")
-                    mapped.append(
-                        SchemaDoc(
-                            doc_id=str(metadata.pop("doc_id", "")),
-                            doc_type=str(metadata.pop("doc_type", "table")),
-                            content=content,
-                            metadata=metadata,
-                        )
-                    )
-                if mapped:
-                    return mapped
-            except Exception:
-                pass
-
-        if self.vector_store is None:
-            return []
-        results: List[Document] = self.vector_store.similarity_search(query, k=top_k)
-
-        # Convert LC Documents back to SchemaDoc-like objects for downstream logic
-        mapped: List[SchemaDoc] = []
-        for doc in results:
-            meta = doc.metadata or {}
-            mapped.append(
-                SchemaDoc(
-                    doc_id=meta.get("doc_id", ""),
-                    doc_type=meta.get("doc_type", "table"),
-                    content=doc.page_content,
-                    metadata={k: v for k, v in meta.items() if k not in ["doc_id", "doc_type"]}
-                )
-            )
-        return mapped
-    
-    def _retrieve_by_keyword(self, query: str, top_k: int) -> List[SchemaDoc]:
-        """Keyword-based fallback retrieval"""
-        query_words = set(query.lower().split())
-        
-        scores = []
-        for doc in self.documents:
-            doc_words = set(doc.content.lower().split())
-            overlap = len(query_words & doc_words)
-            scores.append((overlap, doc))
-        
-        scores.sort(key=lambda x: x[0], reverse=True)
-        return [doc for score, doc in scores[:top_k] if score > 0]
-    
+    # ------------------------------------------------------------------
+    # Default schema / example population
+    # Called by initialize_connection after RAGEngine is created.
+    # ------------------------------------------------------------------
     def load_default_schema(self):
-        """Load travel booking aggregated views schema"""
-
-        # AGENT LEVEL VIEW
-        self.add_table(
-            name="agent_level_view",
-            description="Aggregated booking data at the agent level with sales, profit, and booking counts per agent per date",
-            columns=[
-                {"name": "agentid", "type": "BIGINT", "description": "Agent unique identifier"},
-                {"name": "agentcode", "type": "VARCHAR(10)", "description": "Short agent code"},
-                {"name": "agentname", "type": "VARCHAR(255)", "description": "Agent or agency name"},
-                {"name": "agenttype", "type": "VARCHAR(100)", "description": "Type of agent"},
-                {"name": "agentcountry", "type": "VARCHAR(100)", "description": "Country where agent is based"},
-                {"name": "agentcity", "type": "VARCHAR(100)", "description": "City where agent is based"},
-                {"name": "booking_date", "type": "DATE", "description": "Date when booking was made"},
-                {"name": "checkin_date", "type": "DATE", "description": "Guest check-in date"},
-                {"name": "checkout_date", "type": "DATE", "description": "Guest check-out date"},
-                {"name": "total_sales", "type": "NUMERIC(14,2)", "description": "Total sales amount (revenue)"},
-                {"name": "total_profit", "type": "NUMERIC(14,2)", "description": "Total profit amount"},
-                {"name": "total_booking", "type": "INTEGER", "description": "Total number of bookings"},
-            ],
-            aliases=["agents", "agent bookings", "agent performance", "agent sales"]
+        """Load hard-coded domain examples so RAG has content on first boot."""
+        self.add_example(
+            "show top 10 agents by revenue",
+            "WITH AM AS (SELECT DISTINCT AgentId, AgentName FROM dbo.AgentMaster_V1 WITH (NOLOCK)) "
+            "SELECT TOP 10 AM.AgentName AS [Agent Name], SUM(BD.AgentBuyingPrice) AS [Total Revenue] "
+            "FROM dbo.BookingData BD WITH (NOLOCK) LEFT JOIN AM ON AM.AgentId = BD.AgentId "
+            "WHERE BD.BookingStatus NOT IN ('Cancelled','Not Confirmed','On Request') "
+            "GROUP BY AM.AgentName ORDER BY [Total Revenue] DESC",
         )
-
-        # SUPPLIER LEVEL VIEW
-        self.add_table(
-            name="supplier_level_view",
-            description="Aggregated booking data at the supplier level with sales, profit, and booking counts per supplier per date",
-            columns=[
-                {"name": "supplierid", "type": "BIGINT", "description": "Supplier unique identifier"},
-                {"name": "employeeid", "type": "BIGINT", "description": "Employee identifier linked to supplier"},
-                {"name": "suppliername", "type": "VARCHAR(255)", "description": "Supplier name"},
-                {"name": "booking_date", "type": "DATE", "description": "Date when booking was made"},
-                {"name": "checkin_date", "type": "DATE", "description": "Guest check-in date"},
-                {"name": "checkout_date", "type": "DATE", "description": "Guest check-out date"},
-                {"name": "total_sales", "type": "NUMERIC(14,2)", "description": "Total sales amount (revenue)"},
-                {"name": "total_profit", "type": "NUMERIC(14,2)", "description": "Total profit amount"},
-                {"name": "total_booking", "type": "INTEGER", "description": "Total number of bookings"},
-            ],
-            aliases=["suppliers", "supplier bookings", "supplier performance"]
+        self.add_example(
+            "total bookings by country this month",
+            "WITH MC AS (SELECT DISTINCT CountryID, Country FROM dbo.Master_Country WITH (NOLOCK)) "
+            "SELECT MC.Country AS [Country], COUNT(DISTINCT BD.PNRNo) AS [Total Bookings] "
+            "FROM dbo.BookingData BD WITH (NOLOCK) LEFT JOIN MC ON MC.CountryID = BD.ProductCountryid "
+            "WHERE BD.BookingStatus NOT IN ('Cancelled','Not Confirmed','On Request') "
+            "AND BD.CreatedDate >= DATEFROMPARTS(YEAR(GETDATE()),MONTH(GETDATE()),1) "
+            "AND BD.CreatedDate < DATEADD(MONTH,1,DATEFROMPARTS(YEAR(GETDATE()),MONTH(GETDATE()),1)) "
+            "GROUP BY MC.Country ORDER BY [Total Bookings] DESC",
         )
-
-        # COUNTRY LEVEL VIEW
-        self.add_table(
-            name="country_level_view",
-            description="Aggregated booking data at the destination country level with sales, profit, and booking counts per country per date",
-            columns=[
-                {"name": "productcountryid", "type": "BIGINT", "description": "Product country identifier"},
-                {"name": "countryid", "type": "BIGINT", "description": "Country identifier"},
-                {"name": "country", "type": "VARCHAR(150)", "description": "Destination country name"},
-                {"name": "booking_date", "type": "DATE", "description": "Date when booking was made"},
-                {"name": "checkin_date", "type": "DATE", "description": "Guest check-in date"},
-                {"name": "checkout_date", "type": "DATE", "description": "Guest check-out date"},
-                {"name": "total_sales", "type": "NUMERIC(14,2)", "description": "Total sales amount (revenue)"},
-                {"name": "total_profit", "type": "NUMERIC(14,2)", "description": "Total profit amount"},
-                {"name": "total_booking", "type": "INTEGER", "description": "Total number of bookings"},
-            ],
-            aliases=["countries", "country bookings", "destination countries"]
-        )
-
-        # CITY LEVEL VIEW
-        self.add_table(
-            name="city_level_view",
-            description="Aggregated booking data at the destination city level with sales, profit, and booking counts per city per date",
-            columns=[
-                {"name": "productcityid", "type": "BIGINT", "description": "Product city identifier"},
-                {"name": "cityid", "type": "BIGINT", "description": "City identifier"},
-                {"name": "city", "type": "VARCHAR(150)", "description": "Destination city name"},
-                {"name": "booking_date", "type": "DATE", "description": "Date when booking was made"},
-                {"name": "checkin_date", "type": "DATE", "description": "Guest check-in date"},
-                {"name": "checkout_date", "type": "DATE", "description": "Guest check-out date"},
-                {"name": "total_sales", "type": "NUMERIC(14,2)", "description": "Total sales amount (revenue)"},
-                {"name": "total_profit", "type": "NUMERIC(14,2)", "description": "Total profit amount"},
-                {"name": "total_booking", "type": "INTEGER", "description": "Total number of bookings"},
-            ],
-            aliases=["cities", "city bookings", "destination cities"]
-        )
-
-        # CLIENT NATIONALITY LEVEL VIEW
-        self.add_table(
-            name="client_nationality_level_view",
-            description="Aggregated booking data at the client nationality level with sales, profit, and booking counts per nationality per date",
-            columns=[
-                {"name": "clientnationality", "type": "VARCHAR(150)", "description": "Client/guest nationality"},
-                {"name": "booking_date", "type": "DATE", "description": "Date when booking was made"},
-                {"name": "checkin_date", "type": "DATE", "description": "Guest check-in date"},
-                {"name": "checkout_date", "type": "DATE", "description": "Guest check-out date"},
-                {"name": "total_sales", "type": "NUMERIC(14,2)", "description": "Total sales amount (revenue)"},
-                {"name": "total_profit", "type": "NUMERIC(14,2)", "description": "Total profit amount"},
-                {"name": "total_booking", "type": "INTEGER", "description": "Total number of bookings"},
-            ],
-            aliases=["nationalities", "nationality bookings", "guest nationalities", "client nationalities"]
-        )
-
-        # HOTEL LEVEL VIEW
-        self.add_table(
-            name="hotel_level_view",
-            description="Aggregated booking data at the hotel/product level with sales, profit, and booking counts per hotel per date",
-            columns=[
-                {"name": "productname", "type": "VARCHAR(255)", "description": "Hotel or product name"},
-                {"name": "booking_date", "type": "DATE", "description": "Date when booking was made"},
-                {"name": "checkin_date", "type": "DATE", "description": "Guest check-in date"},
-                {"name": "checkout_date", "type": "DATE", "description": "Guest check-out date"},
-                {"name": "total_sales", "type": "NUMERIC(14,2)", "description": "Total sales amount (revenue)"},
-                {"name": "total_profit", "type": "NUMERIC(14,2)", "description": "Total profit amount"},
-                {"name": "total_booking", "type": "INTEGER", "description": "Total number of bookings"},
-            ],
-            aliases=["hotels", "hotel bookings", "products", "hotel performance"]
-        )
-
-        # HOTEL CHAIN LEVEL VIEW
-        self.add_table(
-            name="hotel_chain_level_view",
-            description="Aggregated booking data at the hotel chain level with sales, profit, and booking counts per chain per date",
-            columns=[
-                {"name": "productid", "type": "BIGINT", "description": "Product identifier"},
-                {"name": "hotelid", "type": "BIGINT", "description": "Hotel identifier"},
-                {"name": "hotelname", "type": "VARCHAR(255)", "description": "Hotel name"},
-                {"name": "chain", "type": "VARCHAR(150)", "description": "Hotel chain name (e.g., Marriott, Hilton)"},
-                {"name": "booking_date", "type": "DATE", "description": "Date when booking was made"},
-                {"name": "checkin_date", "type": "DATE", "description": "Guest check-in date"},
-                {"name": "checkout_date", "type": "DATE", "description": "Guest check-out date"},
-                {"name": "total_sales", "type": "NUMERIC(14,2)", "description": "Total sales amount (revenue)"},
-                {"name": "total_profit", "type": "NUMERIC(14,2)", "description": "Total profit amount"},
-                {"name": "total_booking", "type": "INTEGER", "description": "Total number of bookings"},
-            ],
-            aliases=["hotel chains", "chain bookings", "chain performance"]
-        )
-
-        # SYNONYMS
-        self.add_synonym("revenue", "total_sales", "SUM(total_sales) in any view")
-        self.add_synonym("sales", "total_sales", "SUM(total_sales) in any view")
-        self.add_synonym("income", "total_sales", "SUM(total_sales) in any view")
-        self.add_synonym("profit", "total_profit", "SUM(total_profit) in any view")
-        self.add_synonym("bookings", "total_booking", "SUM(total_booking) in any view")
-        self.add_synonym("nationality", "clientnationality", "client_nationality_level_view table")
-        self.add_synonym("country", "country", "country_level_view table for destinations")
-        self.add_synonym("city", "city", "city_level_view table for destinations")
-        self.add_synonym("hotel", "productname", "hotel_level_view table")
-        self.add_synonym("chain", "chain", "hotel_chain_level_view table")
-
-        # BUSINESS RULES
-        self.add_rule(
-            "aggregated_views",
-            "All tables are pre-aggregated views. Use SUM() for total_sales, total_profit, total_booking when grouping by dimensions. Each row already represents an aggregate per dimension per date.",
-            "SUM(total_sales) AS revenue, SUM(total_profit) AS profit, SUM(total_booking) AS bookings"
+        self.add_example(
+            "supplier with highest bookings last week",
+            "WITH SM AS (SELECT DISTINCT EmployeeId, SupplierName FROM dbo.suppliermaster_Report WITH (NOLOCK)) "
+            "SELECT TOP 1 SM.SupplierName AS [Supplier Name], COUNT(DISTINCT BD.PNRNo) AS [Total Bookings] "
+            "FROM dbo.BookingData BD WITH (NOLOCK) LEFT JOIN SM ON SM.EmployeeId = BD.SupplierId "
+            "WHERE BD.BookingStatus NOT IN ('Cancelled','Not Confirmed','On Request') "
+            "AND BD.CreatedDate >= DATEADD(DAY,-(DATEPART(WEEKDAY,CAST(GETDATE() AS DATE))-1)-7,CAST(GETDATE() AS DATE)) "
+            "AND BD.CreatedDate < DATEADD(DAY,-(DATEPART(WEEKDAY,CAST(GETDATE() AS DATE))-1),CAST(GETDATE() AS DATE)) "
+            "GROUP BY SM.SupplierName ORDER BY [Total Bookings] DESC",
         )
         self.add_rule(
-            "date_columns",
-            "Each view has three date columns: booking_date (when booked), checkin_date (guest arrival), checkout_date (guest departure). Use the appropriate one based on the user's question.",
-            "WHERE booking_date >= CURRENT_DATE - INTERVAL '7 days'"
+            "Status exclusion",
+            "Always filter: BookingStatus NOT IN ('Cancelled','Not Confirmed','On Request')",
         )
         self.add_rule(
-            "choose_correct_view",
-            "Choose the view that matches the user's question: agent_level_view for agent queries, supplier_level_view for supplier queries, country_level_view for country/destination queries, city_level_view for city queries, client_nationality_level_view for nationality queries, hotel_level_view for hotel queries, hotel_chain_level_view for chain queries.",
-            None
+            "SARGable dates",
+            "Never use CAST(date_col AS DATE) in WHERE. Use date_col >= start AND date_col < end.",
         )
-
-        # EXAMPLE QUERIES
-        self.add_example(
-            "Show top 5 agents by revenue",
-            "SELECT agentname, SUM(total_sales) AS revenue FROM agent_level_view GROUP BY agentname ORDER BY revenue DESC LIMIT 5",
-            variations=[
-                "top agents",
-                "best performing agents",
-                "which agents have highest revenue",
-                "agent performance",
-            ]
+        self.add_rule(
+            "CTE dedup",
+            "Lookup tables (AgentMaster_V1, suppliermaster_Report, Master_Country, Master_City) "
+            "have duplicates. Always wrap in a CTE with SELECT DISTINCT before joining.",
         )
-
-        self.add_example(
-            "Revenue by country this month",
-            "SELECT country, SUM(total_sales) AS revenue, SUM(total_booking) AS bookings FROM country_level_view WHERE date_trunc('month', booking_date) = date_trunc('month', CURRENT_DATE) GROUP BY country ORDER BY revenue DESC",
-            variations=[
-                "breakdown by country",
-                "revenue per country",
-                "bookings by country",
-            ]
-        )
-
-        self.add_example(
-            "Top hotels by bookings last month",
-            "SELECT productname, SUM(total_booking) AS bookings, SUM(total_sales) AS revenue FROM hotel_level_view WHERE date_trunc('month', booking_date) = date_trunc('month', CURRENT_DATE - INTERVAL '1 month') GROUP BY productname ORDER BY bookings DESC LIMIT 10",
-            variations=[
-                "best hotels last month",
-                "most booked hotels",
-                "hotel performance last month",
-            ]
-        )
-
-        self.add_example(
-            "Bookings by client nationality this year",
-            "SELECT clientnationality, SUM(total_booking) AS bookings, SUM(total_sales) AS revenue FROM client_nationality_level_view WHERE EXTRACT(YEAR FROM booking_date) = EXTRACT(YEAR FROM CURRENT_DATE) GROUP BY clientnationality ORDER BY bookings DESC LIMIT 20",
-            variations=[
-                "nationality breakdown",
-                "guest nationalities",
-                "bookings by nationality",
-            ]
-        )
-
-        self.add_example(
-            "Top cities by revenue",
-            "SELECT city, SUM(total_sales) AS revenue, SUM(total_profit) AS profit FROM city_level_view GROUP BY city ORDER BY revenue DESC LIMIT 10",
-            variations=[
-                "best cities",
-                "top destinations",
-                "city performance",
-            ]
-        )
-
-
-# Optional singleton (lazy) for scripts that want a process-global instance.
-rag_engine = None
-
-
-def get_rag_engine() -> RAGEngine:
-    global rag_engine
-    if rag_engine is None:
-        rag_engine = RAGEngine()
-    return rag_engine
+        self.build_index()

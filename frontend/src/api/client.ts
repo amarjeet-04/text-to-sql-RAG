@@ -1,5 +1,11 @@
 import axios from 'axios';
-import type { LoginResponse, ConnectRequest, ConnectResponse, QueryResponse } from '../types';
+import type {
+  LoginResponse,
+  ConnectRequest,
+  ConnectResponse,
+  QueryResponse,
+  NLStatusResponse,
+} from '../types';
 
 const api = axios.create({
   baseURL: '/api',
@@ -53,12 +59,93 @@ export async function sendQuery(question: string): Promise<QueryResponse> {
 export async function fetchNLResponse(
   question: string,
   results: Record<string, unknown>[],
+  requestId?: string,
 ): Promise<{ nl_answer: string }> {
   const { data } = await api.post<{ nl_answer: string }>('/chat/nl-response', {
     question,
     results,
+    request_id: requestId,
   });
   return data;
+}
+
+export async function pollNLResponse(requestId: string): Promise<NLStatusResponse> {
+  const { data } = await api.get<NLStatusResponse>('/chat/nl-response', {
+    params: { request_id: requestId },
+  });
+  return data;
+}
+
+interface NLStreamHandlers {
+  onToken?: (token: string) => void;
+  onDone?: (answer: string) => void;
+  onError?: (error: string) => void;
+}
+
+export async function streamNLResponse(requestId: string, handlers: NLStreamHandlers): Promise<void> {
+  const token = localStorage.getItem('token');
+  const response = await fetch(`/api/chat/nl-stream?request_id=${encodeURIComponent(requestId)}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    method: 'GET',
+  });
+  if (!response.ok || !response.body) {
+    throw new Error(`NL stream failed with status ${response.status}`);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+
+  const handleEvent = (eventBlock: string) => {
+    const lines = eventBlock.split('\n');
+    let eventName = 'message';
+    const dataLines: string[] = [];
+    for (const line of lines) {
+      if (line.startsWith('event:')) {
+        eventName = line.slice(6).trim();
+      } else if (line.startsWith('data:')) {
+        dataLines.push(line.slice(5).trim());
+      }
+    }
+    if (dataLines.length === 0) {
+      return;
+    }
+    const rawData = dataLines.join('\n');
+    let payload: Record<string, unknown> = {};
+    try {
+      payload = JSON.parse(rawData) as Record<string, unknown>;
+    } catch {
+      payload = {};
+    }
+    if (eventName === 'token') {
+      const tokenPiece = String(payload.token ?? '');
+      if (tokenPiece) handlers.onToken?.(tokenPiece);
+      return;
+    }
+    if (eventName === 'done') {
+      handlers.onDone?.(String(payload.nl_answer ?? ''));
+      return;
+    }
+    if (eventName === 'error') {
+      const err = String(payload.error ?? 'nl_stream_error');
+      handlers.onError?.(err);
+      throw new Error(err);
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let splitIndex = buffer.indexOf('\n\n');
+    while (splitIndex >= 0) {
+      const eventBlock = buffer.slice(0, splitIndex).trim();
+      buffer = buffer.slice(splitIndex + 2);
+      if (eventBlock) {
+        handleEvent(eventBlock);
+      }
+      splitIndex = buffer.indexOf('\n\n');
+    }
+  }
 }
 
 export async function clearChat(): Promise<void> {

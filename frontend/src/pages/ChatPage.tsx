@@ -23,7 +23,15 @@ import {
 import { useNavigate } from 'react-router-dom';
 import ChatMessage from '../components/ChatMessage';
 import Sidebar from '../components/Sidebar';
-import { sendQuery, clearChat, getDbStatus, connectDb, fetchNLResponse } from '../api/client';
+import {
+  sendQuery,
+  clearChat,
+  getDbStatus,
+  connectDb,
+  fetchNLResponse,
+  pollNLResponse,
+  streamNLResponse,
+} from '../api/client';
 import logo from '../assets/globe_logo.png';
 import type { User, ChatEntry } from '../types';
 
@@ -149,21 +157,77 @@ export default function ChatPage() {
       };
       setChatHistory((prev) => [...prev, entry]);
 
-      // Phase 2: fetch NL summary in the background (results already visible)
-      if (response.nl_pending && response.results && response.results.length > 0) {
-        fetchNLResponse(q, response.results)
-          .then(({ nl_answer }) => {
-            setChatHistory((prev) =>
-              prev.map((e, idx) =>
-                idx === prev.length - 1
-                  ? { ...e, response: { ...e.response, nl_answer, nl_pending: false } }
-                  : e,
-              ),
-            );
-          })
-          .catch(() => {
-            // NL summary failed — results are still visible, no user-facing error needed
-          });
+      const requestId = response.request_id || '';
+      if (response.nl_pending && response.results && response.results.length > 0 && requestId) {
+        window.setTimeout(() => {
+          pollNLResponse(requestId)
+            .then((statusResp) => {
+              if (statusResp.status === 'ready' && statusResp.nl_answer) {
+                setChatHistory((prev) =>
+                  prev.map((e) =>
+                    e.response.request_id === requestId
+                      ? { ...e, response: { ...e.response, nl_answer: statusResp.nl_answer, nl_pending: false } }
+                      : e,
+                  ),
+                );
+                return;
+              }
+              if (statusResp.status === 'pending') {
+                streamNLResponse(requestId, {
+                  onToken: (token) => {
+                    setChatHistory((prev) =>
+                      prev.map((e) =>
+                        e.response.request_id === requestId
+                          ? {
+                              ...e,
+                              response: {
+                                ...e.response,
+                                nl_answer: `${e.response.nl_answer || ''}${token}`,
+                                nl_pending: true,
+                              },
+                            }
+                          : e,
+                      ),
+                    );
+                  },
+                  onDone: (answer) => {
+                    setChatHistory((prev) =>
+                      prev.map((e) =>
+                        e.response.request_id === requestId
+                          ? { ...e, response: { ...e.response, nl_answer: answer, nl_pending: false } }
+                          : e,
+                      ),
+                    );
+                  },
+                }).catch(() => {
+                  fetchNLResponse(q, response.results || [], requestId)
+                    .then(({ nl_answer }) => {
+                      setChatHistory((prev) =>
+                        prev.map((e) =>
+                          e.response.request_id === requestId
+                            ? { ...e, response: { ...e.response, nl_answer, nl_pending: false } }
+                            : e,
+                        ),
+                      );
+                    })
+                    .catch(() => {});
+                });
+              }
+            })
+            .catch(() => {
+              fetchNLResponse(q, response.results || [], requestId)
+                .then(({ nl_answer }) => {
+                  setChatHistory((prev) =>
+                    prev.map((e) =>
+                      e.response.request_id === requestId
+                        ? { ...e, response: { ...e.response, nl_answer, nl_pending: false } }
+                        : e,
+                    ),
+                  );
+                })
+                .catch(() => {});
+            });
+        }, 250);
       }
     } catch (err: unknown) {
       const axiosErr = err as { response?: { data?: { detail?: string } } };
