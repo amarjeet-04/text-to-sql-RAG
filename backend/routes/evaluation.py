@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
 from pydantic import BaseModel
 
 from backend.services.session import Session
-from backend.services.sql_engine import _clean_sql_response, fix_common_sql_errors
+from backend.services.sql_engine import _clean_sql_response, fix_common_sql_errors, _build_relative_date_reference
 from backend.routes.deps import get_session
 from app.evaluation import (
     SQLEvaluator,
@@ -261,9 +261,17 @@ def run_evaluation(req: RunEvalRequest, session: Session = Depends(get_session))
 def _generate_sql(session: Session, question: str) -> str:
     """Generate SQL using the session's configured chain."""
     try:
-        resp = session.sql_chain.invoke({"question": question, "context": ""})
+        resp = session.sql_chain.invoke(
+            {
+                "question": question,
+                "context": "",
+                "dialect_label": "Postgres" if session.sql_dialect == "postgres" else "SQL Server",
+                "relative_date_reference": _build_relative_date_reference(),
+                "enable_nolock": str(bool(session.enable_nolock)).lower(),
+            }
+        )
         cleaned = _clean_sql_response(resp.strip())
-        cleaned = fix_common_sql_errors(cleaned)
+        cleaned = fix_common_sql_errors(cleaned, dialect=session.sql_dialect)
         return cleaned
     except Exception as e:
         return f"ERROR: {str(e)}"

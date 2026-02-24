@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from typing import Optional
 
 from backend.services.session import store, Session
-from backend.services.sql_engine import initialize_connection
+from backend.services.sql_engine import initialize_connection, normalize_sql_dialect
 from backend.routes.deps import get_session
 
 router = APIRouter(prefix="/api/db", tags=["database"])
@@ -21,6 +21,8 @@ class ConnectRequest(BaseModel):
     temperature: float = 0.0
     query_timeout: int = 30
     view_support: bool = True
+    sql_dialect: str = "sqlserver"
+    enable_nolock: bool = False
 
 
 class ConnectResponse(BaseModel):
@@ -62,6 +64,8 @@ def connect_db(req: ConnectRequest, session: Session = Depends(get_session)):
         session.embedder = embedder
         session.cached_schema_text = cached_schema_text
         session.connected = True
+        session.sql_dialect = normalize_sql_dialect(req.sql_dialect)
+        session.enable_nolock = bool(req.enable_nolock)
         session.query_cache = []
         session.chat_history = []
         session.conversation_context = ""

@@ -98,6 +98,8 @@ class Session:
     embedder: Any = None
     cached_schema_text: str = ""
     connected: bool = False
+    sql_dialect: str = "sqlserver"
+    enable_nolock: bool = False
 
     # Chat state
     chat_history: List[Dict] = field(default_factory=list)

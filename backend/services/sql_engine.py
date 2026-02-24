@@ -3,6 +3,7 @@ SQL Engine - Core logic extracted from streamlit_app.py.
 Handles intent detection, SQL generation, validation, caching, and execution.
 """
 import re
+import json
 import os
 import sys
 import time
@@ -10,7 +11,8 @@ import socket
 import logging
 from typing import Optional, Tuple, List, Dict, Any
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from collections import OrderedDict
 
 import numpy as np
@@ -41,6 +43,7 @@ DATABASE_ENTITY_WORDS = {
 }
 MAX_CACHE_SIZE = 50
 BLOCKED_KEYWORDS = {"drop", "delete", "truncate", "insert", "update", "alter", "create", "exec", "execute", "grant", "revoke"}
+DEFAULT_SQL_DIALECT = "sqlserver"
 
 # Broad / vague business-overview detection.
 # This is a deliberate "de-clevering" guardrail to prevent the LLM from
@@ -228,6 +231,79 @@ class GlobalQueryCache:
 _GLOBAL_QUERY_CACHE = GlobalQueryCache()
 
 
+def normalize_sql_dialect(dialect: Optional[str]) -> str:
+    d = (dialect or "").strip().lower()
+    if d in {"postgresql", "postgres", "psql"}:
+        return "postgres"
+    if d in {"sqlserver", "mssql", "sql server"}:
+        return "sqlserver"
+    return DEFAULT_SQL_DIALECT
+
+
+def _dialect_label(dialect: str) -> str:
+    d = normalize_sql_dialect(dialect)
+    return "Postgres" if d == "postgres" else "SQL Server"
+
+
+def _detect_sql_dialect_from_db(db: Optional[SQLDatabase]) -> str:
+    try:
+        name = (db._engine.dialect.name or "").lower() if db is not None else ""
+    except Exception:
+        name = ""
+    if "postgres" in name:
+        return "postgres"
+    return "sqlserver"
+
+
+def _get_ist_now() -> datetime:
+    return datetime.now(ZoneInfo("Asia/Kolkata"))
+
+
+def _get_ist_date_ranges(now_ist: Optional[datetime] = None) -> Dict[str, str]:
+    now = now_ist or _get_ist_now()
+    today = now.date()
+    tomorrow = today + timedelta(days=1)
+    yesterday = today - timedelta(days=1)
+    this_week_start = today - timedelta(days=today.weekday())  # Monday
+    next_week_start = this_week_start + timedelta(days=7)
+    last_week_start = this_week_start - timedelta(days=7)
+    month_start = today.replace(day=1)
+    if month_start.month == 12:
+        next_month_start = month_start.replace(year=month_start.year + 1, month=1, day=1)
+    else:
+        next_month_start = month_start.replace(month=month_start.month + 1, day=1)
+    this_year_start = today.replace(month=1, day=1)
+    next_year_start = this_year_start.replace(year=this_year_start.year + 1)
+    return {
+        "today_start": today.isoformat(),
+        "today_end": tomorrow.isoformat(),
+        "yesterday_start": yesterday.isoformat(),
+        "yesterday_end": today.isoformat(),
+        "this_week_start": this_week_start.isoformat(),
+        "this_week_end": next_week_start.isoformat(),
+        "last_week_start": last_week_start.isoformat(),
+        "last_week_end": this_week_start.isoformat(),
+        "this_month_start": month_start.isoformat(),
+        "this_month_end": next_month_start.isoformat(),
+        "this_year_start": this_year_start.isoformat(),
+        "this_year_end": next_year_start.isoformat(),
+        "now_ist": now.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def _build_relative_date_reference(now_ist: Optional[datetime] = None) -> str:
+    r = _get_ist_date_ranges(now_ist)
+    return (
+        f"now_ist={r['now_ist']}; "
+        f"today=[{r['today_start']},{r['today_end']}); "
+        f"yesterday=[{r['yesterday_start']},{r['yesterday_end']}); "
+        f"this_week=[{r['this_week_start']},{r['this_week_end']}); "
+        f"last_week=[{r['last_week_start']},{r['last_week_end']}); "
+        f"this_month=[{r['this_month_start']},{r['this_month_end']}); "
+        f"this_year=[{r['this_year_start']},{r['this_year_end']})"
+    )
+
+
 GREETING_PATTERNS = {"hi", "hello", "hey", "good morning", "good afternoon", "good evening", "howdy", "greetings"}
 THANKS_PATTERNS = {"thank", "thanks", "thx", "appreciate", "grateful"}
 HELP_PATTERNS = {"help", "what can you do", "how do you work", "capabilities", "what are you"}
@@ -280,97 +356,20 @@ Instructions:
 Answer:"""
 )
 
-SQL_TEMPLATE = """You are a SQL generator for Microsoft SQL Server. Output ONLY valid SELECT SQL. No explanations.
+SQL_TEMPLATE = """You are an elite SQL performance engineer and Text-to-SQL agent.
 
-SCHEMA:
-{full_schema}
+GOAL:
+Given the user's question + provided database schema context, produce ONE optimized SQL query for large datasets.
 
-DOMAIN BUSINESS RULES (from stored procedures — follow strictly):
-{stored_procedure_guidance}
+DIALECT:
+- Active dialect: {dialect_label}
+- Default to SQL Server unless the session explicitly sets Postgres.
+- Use correct syntax for the active dialect (TOP for SQL Server, LIMIT for Postgres).
 
-CONVERSATION CONTEXT (previous queries in this session — use SQL shown to build follow-ups):
-{context}
-
-USER QUESTION: {question}
-
-=== FOLLOW-UP QUERY RULES (read first if there is prior context) ===
-If the user's question is a follow-up or refinement of a previous query (signals: "what about X",
-"only for Y", "filter by Z", "same but", "now show", "and also", "just X", "drill down", etc.):
-  1. Find the most recent SQL in the CONVERSATION CONTEXT above.
-  2. Keep the same table joins, CTE structure, metrics, and date filters from that SQL.
-  3. ONLY add/change the WHERE clause to apply the new filter the user asked for.
-  4. Do NOT start from scratch — reuse the previous query structure as the base.
-  Example: if previous SQL queried agents by cost for last week, and user asks "what about UAE agents?",
-  add "AND BD.AgentCountry = 'UAE'" (or whatever the correct column is) to the existing WHERE clause.
-
-CRITICAL RULES — FOLLOW STRICTLY:
-
-=== INTENT PRECISION ===
-1. ONLY return columns/metrics the user EXPLICITLY asked for. Do NOT add extra metrics.
-   If user says "cost wise" → return ONLY SUM(CompanyBuyingPrice). Do NOT add revenue, profit, bookings, avg_booking_value.
-   If user says "revenue" → return ONLY SUM(AgentBuyingPrice). Do NOT add cost, profit, bookings.
-   If user asks multiple metrics explicitly, return those and ONLY those.
-
-2. Metric intent (strict — use ONLY the one matching the user's words):
-    - "cost"/"expense"/"spend"/"buying cost"/"cost wise"  → SUM(CompanyBuyingPrice)
-    - "revenue"/"sales"/"selling"                          → SUM(AgentBuyingPrice)
-    - "profit"/"margin"                                    → SUM(AgentBuyingPrice - CompanyBuyingPrice)
-    - "bookings"/"count"/"number of bookings"              → COUNT(DISTINCT PNRNo)
-    - "room nights"/"nights"                               → SUM(DATEDIFF(DAY, CheckInDate, CheckOutDate))
-    - "booking window"/"lead time"                         → AVG(DATEDIFF(DAY, CreatedDate, CheckInDate))
-    - "avg booking value"/"average value"                  → SUM(AgentBuyingPrice)/NULLIF(COUNT(DISTINCT PNRNo),0)
-
-=== DATE COLUMN MAPPING (CRITICAL) ===
-3. Match date columns to user intent — this is NOT optional:
-   - "travel date" / "check-in" / "stay date" / "stay"  → use CheckInDate (NOT CreatedDate)
-   - "booking date" / "created date" / "booked on"       → use CreatedDate
-   - "checkout" / "departure"                             → use CheckOutDate
-   - Default (no date hint)                               → use CreatedDate
-
-4. Date ranges (SARGable — NEVER wrap date columns in CAST/YEAR/MONTH in WHERE):
-   - "last week":      date_col >= DATEADD(DAY, -(DATEPART(WEEKDAY,CAST(GETDATE() AS DATE))-1)-7, CAST(GETDATE() AS DATE))
-                        AND date_col < DATEADD(DAY, -(DATEPART(WEEKDAY,CAST(GETDATE() AS DATE))-1), CAST(GETDATE() AS DATE))
-   - "this week":      date_col >= DATEADD(DAY, -(DATEPART(WEEKDAY,CAST(GETDATE() AS DATE))-1), CAST(GETDATE() AS DATE))
-                        AND date_col < DATEADD(DAY, 7-(DATEPART(WEEKDAY,CAST(GETDATE() AS DATE))-1), CAST(GETDATE() AS DATE))
-   - "this month":     date_col >= DATEFROMPARTS(YEAR(GETDATE()),MONTH(GETDATE()),1)
-                        AND date_col < DATEADD(MONTH,1,DATEFROMPARTS(YEAR(GETDATE()),MONTH(GETDATE()),1))
-   - "this year":      date_col >= DATEFROMPARTS(YEAR(GETDATE()),1,1) AND date_col < DATEFROMPARTS(YEAR(GETDATE())+1,1,1)
-   - "yesterday":      date_col >= DATEADD(DAY,-1,CAST(GETDATE() AS DATE)) AND date_col < CAST(GETDATE() AS DATE)
-
-=== SQL OPTIMIZATION (for large datasets) ===
-5. Use CTE with DISTINCT for ALL lookup table joins. Lookup tables (AgentMaster_V1, suppliermaster_Report,
-   Master_Country, Master_City, Hotelchain) contain duplicates — ALWAYS deduplicate in a CTE first.
-   Pattern:
-     WITH AM AS (SELECT DISTINCT AgentId, AgentName FROM dbo.AgentMaster_V1 WITH (NOLOCK)),
-     main AS (SELECT AM.AgentName, <metric> FROM dbo.BookingData BD WITH (NOLOCK) LEFT JOIN AM ON AM.AgentId = BD.AgentId WHERE <filters> GROUP BY AM.AgentName)
-     SELECT TOP N AgentName, <metric> FROM main ORDER BY <metric> DESC
-
-6. For ranking (TOP N) queries: aggregate in a CTE first, then do TOP N + ORDER BY in the outer SELECT.
-   This avoids sorting the entire dataset before filtering.
-
-7. Add WITH (NOLOCK) after EVERY table/CTE reference for read performance.
-
-8. Proper join order: always put the largest table (BookingData) as the driving table in FROM,
-   then LEFT JOIN smaller lookup tables.
-
-9. Prefer index-friendly conditions: use direct column comparisons, avoid functions on indexed columns in WHERE.
-
-=== SCHEMA & FILTERS ===
-10. ONLY use table/column names from SCHEMA above. NEVER invent table names or columns.
-11. ALWAYS apply: BookingStatus NOT IN ('Cancelled','Not Confirmed','On Request')
-    Exception: omit ONLY when question explicitly asks for cancelled bookings.
-12. NEVER output raw ID columns (AgentId, ProductId, HotelId, etc.) in SELECT — use name columns.
-13. Use LIKE '%value%' for text search. Use TOP N (never LIMIT). No UNION/UNION ALL.
-14. ClientNatinality is spelled with one 'o' — use exactly: BD.ClientNatinality.
-15. Do NOT reference columns marked NOT USED in DOMAIN BUSINESS RULES (AgentSellingPrice, PaymentType, etc.).
-16. For ranking: GROUP BY ONLY the entity dimension — do NOT add dates to GROUP BY.
-17. Result column aliases MUST be user-friendly: use spaces and title case (e.g. "Agent Name", "Total Cost", "Total Revenue").
-
-{few_shot_examples}
-
-SQL:"""
-
-RETRY_PROMPT_TEMPLATE = """Output ONLY one Microsoft SQL Server SELECT query. No markdown, no explanations.
+OUTPUT FORMAT (strict):
+1) SQL (single query) in one code block.
+2) Optional "Notes:" with at most 3 bullets (assumptions only).
+3) No other text.
 
 SCHEMA:
 {full_schema}
@@ -378,28 +377,83 @@ SCHEMA:
 DOMAIN BUSINESS RULES:
 {stored_procedure_guidance}
 
-QUESTION: {question}
+CONVERSATION CONTEXT:
+{context}
 
-CRITICAL RULES:
-1. ONLY return the metric the user asked for. Do NOT add extra columns.
-   "cost wise" → ONLY SUM(CompanyBuyingPrice). "revenue" → ONLY SUM(AgentBuyingPrice).
-2. Date column mapping:
-   "travel date"/"check-in"/"stay" → CheckInDate | "booking date" → CreatedDate | "checkout" → CheckOutDate
-3. "last week" → date_col >= DATEADD(DAY,-(DATEPART(WEEKDAY,CAST(GETDATE() AS DATE))-1)-7,CAST(GETDATE() AS DATE))
-                  AND date_col < DATEADD(DAY,-(DATEPART(WEEKDAY,CAST(GETDATE() AS DATE))-1),CAST(GETDATE() AS DATE))
-4. Use CTE with DISTINCT for lookup tables (AgentMaster_V1, suppliermaster_Report, etc.) — they have duplicates.
-5. For TOP N: aggregate in CTE, then TOP N + ORDER BY in outer SELECT.
-6. ONLY tables/columns from SCHEMA. Never invent.
-7. Apply BookingStatus NOT IN ('Cancelled','Not Confirmed','On Request').
-8. Date filters must be SARGable: date_col >= <start> AND date_col < <end>. No CAST/YEAR/MONTH on columns.
-9. Add WITH (NOLOCK) after every table reference.
-10. NEVER output raw ID columns — use name columns.
-11. Result aliases must be user-friendly: "Agent Name", "Total Cost" etc.
-12. ClientNatinality spelled with one 'o'.
+ASIA/KOLKATA REFERENCE RANGES (use these to resolve relative dates to explicit ranges):
+{relative_date_reference}
 
-SQL:"""
+USER QUESTION:
+{question}
 
-RANKING_RESHAPE_PROMPT_TEMPLATE = """You must correct a SQL Server ranking query shape.
+OPTIMIZATION RULES (must follow):
+- Filter early and project only required columns (no SELECT *).
+- Write SARGable predicates: never apply functions/casts to indexed columns in WHERE.
+- Use range predicates: col >= start AND col < end.
+- Prefer EXISTS over IN for subquery membership checks.
+- Avoid unnecessary subqueries/CTEs unless they reduce repeated work.
+- Avoid DISTINCT unless required.
+- Join order: start from the most selective filtered table, then join outward.
+- Use GROUP BY only for necessary columns; aggregate after filtering.
+- Prefer index-friendly comparisons and equality joins on keys.
+- String filters: use `=` by default; use `LIKE 'value%'` for prefix intent; use `LIKE '%value%'` only when user explicitly asks for contains/substring.
+- Do not use NOLOCK unless this session explicitly enables it.
+- Session NOLOCK enabled: {enable_nolock}
+
+CONVERSATION MEMORY (must follow):
+- If the user references "same", "above", "that query", reuse the last query intent/tables/filters and apply only the delta.
+- Resolve relative dates (today/this month/yesterday/last week) into explicit date ranges using Asia/Kolkata.
+- Use only provided schema context; never invent table/column names.
+- If the exact mapping is missing, choose the closest known mapping and state it in Notes.
+
+QUALITY CHECK (silent):
+- Predicates are SARGable
+- No redundant scans
+- Correct GROUP BY
+- Correct date range boundaries
+- SQL matches the active dialect
+
+{few_shot_examples}
+
+Return the final SQL."""
+
+RETRY_PROMPT_TEMPLATE = """You are an elite SQL performance engineer and Text-to-SQL agent.
+
+Fix and return ONE optimized query that matches the user's intent.
+
+Active dialect: {dialect_label}
+Session NOLOCK enabled: {enable_nolock}
+Asia/Kolkata date reference: {relative_date_reference}
+
+SCHEMA:
+{full_schema}
+
+DOMAIN BUSINESS RULES:
+{stored_procedure_guidance}
+
+QUESTION:
+{question}
+
+OUTPUT FORMAT (strict):
+1) SQL (single query) in one code block.
+2) Optional "Notes:" with at most 3 bullets (assumptions only).
+3) No other text.
+
+MANDATORY:
+- SARGable date predicates using range filters only.
+- For text filters: `=` first, `LIKE 'x%'` for prefix, `LIKE '%x%'` only if user asked contains.
+- TOP for SQL Server, LIMIT for Postgres.
+- No SELECT *.
+- Do not use NOLOCK unless enabled.
+- Use only schema columns/tables; do not invent.
+
+Return the final SQL."""
+
+RANKING_RESHAPE_PROMPT_TEMPLATE = """You must correct this ranking query while preserving intent.
+
+Active dialect: {dialect_label}
+Session NOLOCK enabled: {enable_nolock}
+Asia/Kolkata date reference: {relative_date_reference}
 
 QUESTION:
 {question}
@@ -416,19 +470,21 @@ CURRENT SQL:
 ISSUE:
 {violation_reason}
 
-REWRITE RULES:
-1. Output ONLY one SQL Server SELECT query (no markdown)
-2. ONLY return the metric the user asked for — remove all extra columns.
-   "cost wise" → only SUM(CompanyBuyingPrice). "revenue" → only SUM(AgentBuyingPrice).
-3. Use CTE with DISTINCT for lookup table joins (AgentMaster_V1 has duplicates).
-   Pattern: WITH AM AS (SELECT DISTINCT ... FROM lookup WITH (NOLOCK)), main AS (SELECT ... GROUP BY ...) SELECT TOP N ... FROM main ORDER BY ...
-4. "travel date"/"check-in"/"stay" → CheckInDate, NOT CreatedDate.
-5. "last week" → CheckInDate >= DATEADD(DAY,-(DATEPART(WEEKDAY,CAST(GETDATE() AS DATE))-1)-7,CAST(GETDATE() AS DATE))
-6. GROUP BY only entity dimension — no dates in GROUP BY for ranking.
-7. Preserve BookingStatus NOT IN filter.
-8. Result aliases must be user-friendly: "Agent Name", "Total Cost" etc.
+RULES:
+- Return ONE query only.
+- Keep only user-requested metric(s).
+- Ranking must aggregate at entity level first, then apply TOP/LIMIT + ORDER BY.
+- Do not group by date unless the question explicitly asks date-wise ranking.
+- SARGable date filters only; resolve relative dates using Asia/Kolkata.
+- Do not use NOLOCK unless enabled.
+- Use only schema-provided objects.
 
-SQL:"""
+OUTPUT FORMAT (strict):
+1) SQL (single query) in one code block.
+2) Optional "Notes:" with at most 3 bullets (assumptions only).
+3) No other text.
+
+Return the final SQL."""
 
 
 # --- Raw ODBC connection helper ---
@@ -552,24 +608,52 @@ def load_schema_from_sqldb(rag_engine: RAGEngine, db: SQLDatabase):
 STORED_PROCEDURE_FILE = Path(__file__).parent.parent.parent / "stored_procedure.txt"
 DEFAULT_STATUS_EXCLUSIONS = ("Cancelled", "Not Confirmed", "On Request")
 
-# Module-level cache so the file is read and the guidance string is built
-# exactly once per process lifetime, not on every query.
-_STORED_PROCEDURE_RAW_CACHE: Optional[str] = None
-_STORED_PROCEDURE_GUIDANCE_CACHE: Optional[str] = None
+# CHANGED: mtime-aware cache for stored procedure raw text + derived guidance.
+# Auto-refreshes when STORED_PROCEDURE_FILE changes on disk.
+_STORED_PROCEDURE_CACHE: Dict[str, Any] = {
+    "path": str(STORED_PROCEDURE_FILE),
+    "mtime_ns": None,
+    "raw_text": "",
+    "raw_hash": None,
+    "guidance": None,
+}
+
+
+def _compute_text_hash(text: str) -> int:
+    return hash(text or "")
 
 
 def _read_stored_procedure_file(path: Path = STORED_PROCEDURE_FILE) -> str:
-    global _STORED_PROCEDURE_RAW_CACHE
-    if _STORED_PROCEDURE_RAW_CACHE is not None:
-        return _STORED_PROCEDURE_RAW_CACHE
+    cache = _STORED_PROCEDURE_CACHE
+    cache["path"] = str(path)
     try:
-        if path.exists():
-            _STORED_PROCEDURE_RAW_CACHE = path.read_text(encoding="utf-8", errors="ignore")
-            return _STORED_PROCEDURE_RAW_CACHE
+        stat = path.stat()
+        mtime_ns = int(stat.st_mtime_ns)
     except Exception:
-        pass
-    _STORED_PROCEDURE_RAW_CACHE = ""
-    return _STORED_PROCEDURE_RAW_CACHE
+        # File missing/unreadable -> keep runtime safe.
+        cache.update({
+            "mtime_ns": None,
+            "raw_text": "",
+            "raw_hash": _compute_text_hash(""),
+            "guidance": None,
+        })
+        return ""
+
+    if cache.get("mtime_ns") == mtime_ns and cache.get("raw_text") is not None:
+        return cache.get("raw_text") or ""
+
+    try:
+        raw_text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        raw_text = ""
+
+    cache.update({
+        "mtime_ns": mtime_ns,
+        "raw_text": raw_text,
+        "raw_hash": _compute_text_hash(raw_text),
+        "guidance": None,  # Invalidate derived guidance when file changes.
+    })
+    return raw_text
 
 
 def _parse_stored_procedure_sections(raw_text: str) -> List[Dict[str, str]]:
@@ -670,15 +754,19 @@ def build_stored_procedure_guidance(raw_text: str) -> str:
       - Hotel chain normalization logic
       - Common query patterns
 
-    The result is cached at module level so parsing + string building happens
-    once per process, not once per query.
+    CHANGED: Guidance cache is tied to file/content fingerprint so it refreshes
+    automatically when stored_procedure.txt changes.
     """
-    global _STORED_PROCEDURE_GUIDANCE_CACHE
-    if _STORED_PROCEDURE_GUIDANCE_CACHE is not None:
-        return _STORED_PROCEDURE_GUIDANCE_CACHE
+    cache = _STORED_PROCEDURE_CACHE
+    raw_hash = _compute_text_hash(raw_text)
+    if cache.get("guidance") is not None and cache.get("raw_hash") == raw_hash:
+        return cache["guidance"]
+    cache["raw_hash"] = raw_hash
 
     sections = _parse_stored_procedure_sections(raw_text)
     if not sections:
+        cache["guidance"] = "No stored procedure guidance available."
+        cache["raw_text"] = raw_text or ""
         return "No stored procedure guidance available."
 
     rules = _extract_domain_rules(sections)
@@ -747,7 +835,7 @@ def build_stored_procedure_guidance(raw_text: str) -> str:
     lines.append("=== SQL OPTIMIZATION (MANDATORY for large datasets) ===")
     lines.append("• Use CTE with DISTINCT for ALL lookup table joins — these tables have duplicates:")
     lines.append("  AgentMaster_V1, suppliermaster_Report, Master_Country, Master_City, Hotelchain")
-    lines.append("  Pattern: WITH AM AS (SELECT DISTINCT col1,col2 FROM table WITH (NOLOCK))")
+    lines.append("  Pattern: WITH AM AS (SELECT DISTINCT col1,col2 FROM table)")
     lines.append("• For ranking (TOP N): aggregate in a CTE, then TOP N + ORDER BY in outer SELECT.")
     lines.append("• Put the largest table (BookingData) as driving table in FROM, LEFT JOIN smaller lookup tables.")
     lines.append("• ONLY return the metric the user asked for. 'cost wise' → ONLY SUM(CompanyBuyingPrice).")
@@ -872,7 +960,7 @@ ag_type AS (
     SELECT
         CASE WHEN AMV.agentcode = 'WEGR' THEN 'We Groups' ELSE AM.agenttype END AS agenttype,
         COUNT(DISTINCT BD.PNRNo) AS total_bookings
-    FROM dbo.BookingData BD WITH (NOLOCK)
+    FROM dbo.BookingData BD
     LEFT JOIN AM ON AM.agentid = BD.agentid
     LEFT JOIN AMV ON AMV.agentid = BD.agentid
     WHERE <date_filter>
@@ -905,12 +993,12 @@ ORDER BY total_bookings DESC""")
     lines.append("=== AGENT RANKING CTE PATTERN (use for ALL top/bottom N agent queries) ===")
     lines.append("""WITH AM AS (
   SELECT DISTINCT AgentId, AgentCode, AgentName, AgentCountry, AgentCity
-  FROM [dbo].[AgentMaster_V1] WITH (NOLOCK)
+  FROM [dbo].[AgentMaster_V1]
 ),
 main AS (
   SELECT DISTINCT AM.AgentName AS [Agent Name],
     SUM(BD.CompanyBuyingPrice) AS [Total Cost]
-  FROM dbo.BookingData BD WITH (NOLOCK)
+  FROM dbo.BookingData BD
   LEFT JOIN AM ON AM.AgentId = BD.AgentId
   WHERE BD.CheckInDate >= <travel_date_start>
     AND BD.CheckInDate < <travel_date_end>
@@ -932,8 +1020,9 @@ ORDER BY [Total Cost] DESC""")
     lines.append("• Single-day: WHERE CreatedDate >= 'YYYY-MM-DD' AND CreatedDate < DATEADD(DAY, 1, 'YYYY-MM-DD') — filter only, do NOT group by date")
     lines.append("• Current year: WHERE CreatedDate >= DATEFROMPARTS(YEAR(GETDATE()),1,1) AND CreatedDate < DATEFROMPARTS(YEAR(GETDATE())+1,1,1)")
 
-    _STORED_PROCEDURE_GUIDANCE_CACHE = "\n".join(lines)
-    return _STORED_PROCEDURE_GUIDANCE_CACHE
+    cache["guidance"] = "\n".join(lines)
+    cache["raw_text"] = raw_text or ""
+    return cache["guidance"]
 
 
 def _add_stored_procedure_knowledge_to_rag(rag_engine: Optional[RAGEngine], raw_text: str):
@@ -1472,9 +1561,22 @@ def _question_mentions_result_value(question_lower: str, previous_result_df) -> 
     skip_words = {"what", "about", "how", "show", "the", "for", "and", "but", "with", "from", "only", "just", "that", "this", "those", "them", "it", "me", "can", "you", "is", "are", "was", "were", "do", "does", "did"}
     question_words = [w.strip("?.,!") for w in question_lower.split() if len(w.strip("?.,!")) > 2 and w.strip("?.,!") not in skip_words]
 
+    # CHANGED: cap scan effort to keep follow-up detection fast on hot path.
+    scanned_cols = 0
     for col in previous_result_df.columns:
+        if scanned_cols >= 3:
+            break
         try:
-            unique_values = previous_result_df[col].dropna().astype(str).str.lower().unique()
+            series = previous_result_df[col].dropna()
+            if series.empty:
+                continue
+            sample_vals = series.astype(str).head(300)
+            # Prefer text-like columns for value mention matching.
+            if not any(c.isalpha() for c in " ".join(sample_vals.head(20).tolist())):
+                continue
+
+            unique_values = sample_vals.str.lower().drop_duplicates().head(50).tolist()
+            scanned_cols += 1
             for val in unique_values:
                 if len(val) > 2:
                     # Check if full value appears in question
@@ -1560,9 +1662,13 @@ Rules:
 - KEEP the same FROM table - do NOT switch to a different table/view
 - KEEP the same SELECT columns, GROUP BY, ORDER BY structure
 - Only ADD or MODIFY the WHERE clause to filter results
-- For filtering by a name/value, add WHERE column LIKE '%value%'
-- For date/year changes, modify date conditions using booking_date, checkin_date, or checkout_date
-- Use LIKE for text matching (MSSQL is case-insensitive by default)
+- Text matching priority:
+  1) exact match with '=' by default
+  2) prefix match with LIKE 'value%' if user intent suggests starts-with/prefix
+  3) contains match with LIKE '%value%' ONLY if user explicitly says contains/substring
+- Keep date filters SARGable:
+  - Use range predicates: date_col >= 'YYYY-MM-DD' AND date_col < 'YYYY-MM-DD'
+  - Do NOT use YEAR(date_col), MONTH(date_col), or CAST(date_col AS DATE) in WHERE
 - ONLY use columns that exist in the table being queried{column_hint}
 
 Modified SQL:"""
@@ -1856,47 +1962,61 @@ def validate_sql(sql: str) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
-def fix_common_sql_errors(sql: str) -> str:
+def fix_common_sql_errors(sql: str, dialect: str = DEFAULT_SQL_DIALECT) -> str:
     if not sql:
         return sql
-    # Convert PostgreSQL LIMIT N to SQL Server TOP N.
-    limit_match = re.search(r"\bLIMIT\s+(\d+)\s*;?\s*$", sql, flags=re.IGNORECASE)
-    if limit_match and not re.search(r"\bSELECT\s+TOP\s+\d+\b", sql, flags=re.IGNORECASE):
-        limit_val = limit_match.group(1)
-        sql = sql[:limit_match.start()].rstrip().rstrip(";")
+    d = normalize_sql_dialect(dialect)
+    if d == "sqlserver":
+        # Convert PostgreSQL LIMIT N to SQL Server TOP N.
+        limit_match = re.search(r"\bLIMIT\s+(\d+)\s*;?\s*$", sql, flags=re.IGNORECASE)
+        if limit_match and not re.search(r"\bSELECT\s+TOP\s+\d+\b", sql, flags=re.IGNORECASE):
+            limit_val = limit_match.group(1)
+            sql = sql[:limit_match.start()].rstrip().rstrip(";")
+            sql = re.sub(
+                r"(?i)^SELECT\s+(DISTINCT\s+)?",
+                lambda m: f"SELECT {m.group(1) or ''}TOP {limit_val} ",
+                sql,
+                count=1,
+            )
+
+        # Normalize date/time functions to SQL Server syntax.
+        sql = re.sub(r"\bCURRENT_DATE\b", "CAST(GETDATE() AS DATE)", sql, flags=re.IGNORECASE)
+        sql = re.sub(r"\bNOW\(\)", "GETDATE()", sql, flags=re.IGNORECASE)
+        sql = re.sub(r"EXTRACT\(\s*YEAR\s+FROM\s+([^)]+)\)", r"YEAR(\1)", sql, flags=re.IGNORECASE)
+        sql = re.sub(r"EXTRACT\(\s*MONTH\s+FROM\s+([^)]+)\)", r"MONTH(\1)", sql, flags=re.IGNORECASE)
         sql = re.sub(
-            r"(?i)^SELECT\s+(DISTINCT\s+)?",
-            lambda m: f"SELECT {m.group(1) or ''}TOP {limit_val} ",
+            r"date_trunc\(\s*'month'\s*,\s*([^)]+)\)",
+            r"DATEFROMPARTS(YEAR(\1), MONTH(\1), 1)",
             sql,
-            count=1,
+            flags=re.IGNORECASE,
+        )
+        sql = re.sub(
+            r"(GETDATE\(\)|CAST\(GETDATE\(\)\s+AS\s+DATE\))\s*-\s*INTERVAL\s*'(\d+)\s+days'",
+            r"DATEADD(DAY, -\2, \1)",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        sql = re.sub(
+            r"(GETDATE\(\)|CAST\(GETDATE\(\)\s+AS\s+DATE\))\s*-\s*INTERVAL\s*'(\d+)\s+months?'",
+            r"DATEADD(MONTH, -\2, \1)",
+            sql,
+            flags=re.IGNORECASE,
         )
 
-    # Normalize date/time functions to SQL Server syntax.
-    sql = re.sub(r"\bCURRENT_DATE\b", "CAST(GETDATE() AS DATE)", sql, flags=re.IGNORECASE)
-    sql = re.sub(r"\bNOW\(\)", "GETDATE()", sql, flags=re.IGNORECASE)
-    sql = re.sub(r"EXTRACT\(\s*YEAR\s+FROM\s+([^)]+)\)", r"YEAR(\1)", sql, flags=re.IGNORECASE)
-    sql = re.sub(r"EXTRACT\(\s*MONTH\s+FROM\s+([^)]+)\)", r"MONTH(\1)", sql, flags=re.IGNORECASE)
-    sql = re.sub(
-        r"date_trunc\(\s*'month'\s*,\s*([^)]+)\)",
-        r"DATEFROMPARTS(YEAR(\1), MONTH(\1), 1)",
-        sql,
-        flags=re.IGNORECASE,
-    )
-    sql = re.sub(
-        r"(GETDATE\(\)|CAST\(GETDATE\(\)\s+AS\s+DATE\))\s*-\s*INTERVAL\s*'(\d+)\s+days'",
-        r"DATEADD(DAY, -\2, \1)",
-        sql,
-        flags=re.IGNORECASE,
-    )
-    sql = re.sub(
-        r"(GETDATE\(\)|CAST\(GETDATE\(\)\s+AS\s+DATE\))\s*-\s*INTERVAL\s*'(\d+)\s+months?'",
-        r"DATEADD(MONTH, -\2, \1)",
-        sql,
-        flags=re.IGNORECASE,
-    )
-
-    # SQL Server does not support ILIKE.
-    sql = re.sub(r"\bILIKE\b", "LIKE", sql, flags=re.IGNORECASE)
+        # SQL Server does not support ILIKE.
+        sql = re.sub(r"\bILIKE\b", "LIKE", sql, flags=re.IGNORECASE)
+    else:
+        # Convert SQL Server TOP N to PostgreSQL LIMIT N.
+        top_match = re.search(r"(?is)^\s*SELECT\s+(DISTINCT\s+)?TOP\s+(\d+)\s+", sql)
+        if top_match and not re.search(r"\bLIMIT\s+\d+\b", sql, flags=re.IGNORECASE):
+            limit_val = top_match.group(2)
+            sql = re.sub(
+                r"(?is)^(\s*SELECT\s+)(DISTINCT\s+)?TOP\s+\d+\s+",
+                lambda m: f"{m.group(1)}{m.group(2) or ''}",
+                sql,
+                count=1,
+            ).rstrip().rstrip(";")
+            sql = f"{sql} LIMIT {limit_val}"
     return sql
 
 
@@ -2086,14 +2206,26 @@ def _inject_nolock_hints(sql: str) -> str:
     return pattern.sub(_repl, sql)
 
 
-def optimize_sql_for_performance(sql: str) -> str:
+def _strip_nolock_hints(sql: str) -> str:
+    if not sql:
+        return sql
+    return re.sub(r"\s+WITH\s*\(\s*NOLOCK\s*\)", "", sql, flags=re.IGNORECASE)
+
+
+def optimize_sql_for_performance(
+    sql: str,
+    dialect: str = DEFAULT_SQL_DIALECT,
+    enable_nolock: bool = False,
+) -> str:
     """Apply safe SQL rewrites that keep intent but improve execution speed."""
     if not sql:
         return sql
+    d = normalize_sql_dialect(dialect)
     optimized = sql
-    optimized = _rewrite_cast_date_predicates_sargable(optimized)
-    optimized = _rewrite_year_month_predicates_sargable(optimized)
-    optimized = _inject_nolock_hints(optimized)
+    if d == "sqlserver":
+        optimized = _rewrite_cast_date_predicates_sargable(optimized)
+        optimized = _rewrite_year_month_predicates_sargable(optimized)
+    optimized = _inject_nolock_hints(optimized) if enable_nolock else _strip_nolock_hints(optimized)
     return optimized
 
 
@@ -2139,12 +2271,19 @@ def _sql_has_date_filter_for_col(sql: str, date_col: str) -> bool:
     return col_lower in sql_lower
 
 
-def apply_query_performance_guardrails(sql: str, question: str, db: Optional[SQLDatabase] = None) -> str:
+def apply_query_performance_guardrails(
+    sql: str,
+    question: str,
+    db: Optional[SQLDatabase] = None,
+    dialect: str = DEFAULT_SQL_DIALECT,
+) -> str:
     """Apply conservative, execution-focused SQL guardrails."""
     if not sql:
         return sql
     guarded = _drop_distinct_when_grouped(sql)
     if db is None:
+        return guarded
+    if normalize_sql_dialect(dialect) != "sqlserver":
         return guarded
 
     # For heavy BookingData aggregates without explicit time scope, constrain to current year.
@@ -2218,15 +2357,15 @@ def _detect_raw_id_columns_in_select(sql: str) -> List[str]:
 
 # Join templates for deterministic ID-column fix (avoids LLM retry).
 _DETERMINISTIC_ID_FIX_JOINS: Dict[str, Dict[str, str]] = {
-    "agentid":          {"name_col": "AgentName",      "join": "LEFT JOIN dbo.AgentMaster_V1 _IDJOIN WITH (NOLOCK) ON _IDJOIN.AgentId = {alias}.AgentId",       "alias_col": "AgentId"},
+    "agentid":          {"name_col": "AgentName",      "join": "LEFT JOIN dbo.AgentMaster_V1 _IDJOIN ON _IDJOIN.AgentId = {alias}.AgentId",       "alias_col": "AgentId"},
     "productid":        {"name_col": "ProductName",     "join": None,  "alias_col": None},  # direct on BookingData
-    "hotelid":          {"name_col": "HotelName",       "join": "LEFT JOIN dbo.Hotelchain _IDJOIN WITH (NOLOCK) ON _IDJOIN.HotelId = {alias}.ProductId",         "alias_col": "ProductId"},
-    "countryid":        {"name_col": "Country",         "join": "LEFT JOIN dbo.Master_Country _IDJOIN WITH (NOLOCK) ON _IDJOIN.CountryID = {alias}.ProductCountryid", "alias_col": "ProductCountryid"},
-    "productcountryid": {"name_col": "Country",         "join": "LEFT JOIN dbo.Master_Country _IDJOIN WITH (NOLOCK) ON _IDJOIN.CountryID = {alias}.ProductCountryid", "alias_col": "ProductCountryid"},
-    "cityid":           {"name_col": "City",            "join": "LEFT JOIN dbo.Master_City _IDJOIN WITH (NOLOCK) ON _IDJOIN.CityId = {alias}.ProductCityId",      "alias_col": "ProductCityId"},
-    "productcityid":    {"name_col": "City",            "join": "LEFT JOIN dbo.Master_City _IDJOIN WITH (NOLOCK) ON _IDJOIN.CityId = {alias}.ProductCityId",      "alias_col": "ProductCityId"},
-    "supplierid":       {"name_col": "suppliername",    "join": "LEFT JOIN dbo.suppliermaster_Report _IDJOIN WITH (NOLOCK) ON _IDJOIN.EmployeeId = {alias}.SupplierId", "alias_col": "SupplierId"},
-    "employeeid":       {"name_col": "suppliername",    "join": "LEFT JOIN dbo.suppliermaster_Report _IDJOIN WITH (NOLOCK) ON _IDJOIN.EmployeeId = {alias}.SupplierId", "alias_col": "SupplierId"},
+    "hotelid":          {"name_col": "HotelName",       "join": "LEFT JOIN dbo.Hotelchain _IDJOIN ON _IDJOIN.HotelId = {alias}.ProductId",         "alias_col": "ProductId"},
+    "countryid":        {"name_col": "Country",         "join": "LEFT JOIN dbo.Master_Country _IDJOIN ON _IDJOIN.CountryID = {alias}.ProductCountryid", "alias_col": "ProductCountryid"},
+    "productcountryid": {"name_col": "Country",         "join": "LEFT JOIN dbo.Master_Country _IDJOIN ON _IDJOIN.CountryID = {alias}.ProductCountryid", "alias_col": "ProductCountryid"},
+    "cityid":           {"name_col": "City",            "join": "LEFT JOIN dbo.Master_City _IDJOIN ON _IDJOIN.CityId = {alias}.ProductCityId",      "alias_col": "ProductCityId"},
+    "productcityid":    {"name_col": "City",            "join": "LEFT JOIN dbo.Master_City _IDJOIN ON _IDJOIN.CityId = {alias}.ProductCityId",      "alias_col": "ProductCityId"},
+    "supplierid":       {"name_col": "suppliername",    "join": "LEFT JOIN dbo.suppliermaster_Report _IDJOIN ON _IDJOIN.EmployeeId = {alias}.SupplierId", "alias_col": "SupplierId"},
+    "employeeid":       {"name_col": "suppliername",    "join": "LEFT JOIN dbo.suppliermaster_Report _IDJOIN ON _IDJOIN.EmployeeId = {alias}.SupplierId", "alias_col": "SupplierId"},
 }
 
 
@@ -2372,17 +2511,26 @@ def expand_fuzzy_search(sql: str, db: Optional[SQLDatabase] = None) -> str:
 
 
 def _clean_sql_response(sql: str) -> str:
-    if sql.startswith('"') and sql.endswith('"'):
-        sql = sql[1:-1]
-    if sql.startswith("'") and sql.endswith("'"):
-        sql = sql[1:-1]
-    if sql.startswith("```sql"):
-        sql = sql[6:]
-    if sql.startswith("```"):
-        sql = sql[3:]
-    if sql.endswith("```"):
-        sql = sql[:-3]
-    return sql.strip()
+    if not sql:
+        return ""
+    cleaned = sql.strip()
+    if cleaned.startswith('"') and cleaned.endswith('"'):
+        cleaned = cleaned[1:-1].strip()
+    if cleaned.startswith("'") and cleaned.endswith("'"):
+        cleaned = cleaned[1:-1].strip()
+
+    fence_match = re.search(r"```(?:sql)?\s*(.*?)```", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if fence_match:
+        cleaned = fence_match.group(1).strip()
+
+    cleaned = re.split(r"(?im)^\s*Notes\s*:", cleaned, maxsplit=1)[0].strip()
+
+    start_match = re.search(r"(?is)\b(with|select)\b", cleaned)
+    if start_match:
+        cleaned = cleaned[start_match.start():].strip()
+
+    cleaned = cleaned.replace("```", "").strip()
+    return cleaned
 
 
 # --- "De-clevering" guardrails ---
@@ -2610,28 +2758,23 @@ def build_business_overview_sql_from_source(source: Dict[str, str], date_scope: 
     profit_expr = source["profit_expr"]
     bookings_expr = source["bookings_expr"]
     status_filter_expr = source.get("status_filter_expr")
+    r = _get_ist_date_ranges()
+    this_month_start = datetime.fromisoformat(r["this_month_start"]).date()
+    this_year_start = datetime.fromisoformat(r["this_year_start"]).date()
 
     if date_scope == "this_month":
-        month_start = "DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)"
-        date_filter = f"{date_col} >= {month_start} AND {date_col} < DATEADD(MONTH, 1, {month_start})"
+        date_filter = f"{date_col} >= '{r['this_month_start']}' AND {date_col} < '{r['this_month_end']}'"
     elif date_scope == "last_month":
-        month_start = "DATEFROMPARTS(YEAR(DATEADD(MONTH, -1, GETDATE())), MONTH(DATEADD(MONTH, -1, GETDATE())), 1)"
-        date_filter = f"{date_col} >= {month_start} AND {date_col} < DATEADD(MONTH, 1, {month_start})"
+        last_month_end = this_month_start
+        last_month_start = (last_month_end.replace(day=1) - timedelta(days=1)).replace(day=1)
+        date_filter = f"{date_col} >= '{last_month_start.isoformat()}' AND {date_col} < '{last_month_end.isoformat()}'"
     elif date_scope == "latest_year":
-        date_filter = (
-            f"{date_col} >= DATEFROMPARTS(YEAR(GETDATE()), 1, 1) "
-            f"AND {date_col} < DATEFROMPARTS(YEAR(GETDATE()) + 1, 1, 1)"
-        )
+        date_filter = f"{date_col} >= '{r['this_year_start']}' AND {date_col} < '{r['this_year_end']}'"
     elif date_scope == "last_year":
-        date_filter = (
-            f"{date_col} >= DATEFROMPARTS(YEAR(GETDATE()) - 1, 1, 1) "
-            f"AND {date_col} < DATEFROMPARTS(YEAR(GETDATE()), 1, 1)"
-        )
+        last_year_start = this_year_start.replace(year=this_year_start.year - 1)
+        date_filter = f"{date_col} >= '{last_year_start.isoformat()}' AND {date_col} < '{this_year_start.isoformat()}'"
     else:
-        date_filter = (
-            f"{date_col} >= DATEFROMPARTS(YEAR(GETDATE()), 1, 1) "
-            f"AND {date_col} < DATEFROMPARTS(YEAR(GETDATE()) + 1, 1, 1)"
-        )
+        date_filter = f"{date_col} >= '{r['this_year_start']}' AND {date_col} < '{r['this_year_end']}'"
 
     where_clauses = [date_filter]
     if status_filter_expr:
@@ -2821,6 +2964,8 @@ def _retry_ranking_shape_if_needed(
     llm,
     full_schema: str,
     stored_procedure_guidance: str,
+    sql_dialect: str = DEFAULT_SQL_DIALECT,
+    enable_nolock: bool = False,
 ) -> str:
     is_ok, reason = validate_ranking_sql_shape(question, sql)
     if is_ok:
@@ -2834,12 +2979,15 @@ def _retry_ranking_shape_if_needed(
         stored_procedure_guidance=stored_procedure_guidance or "",
         current_sql=sql,
         violation_reason=reason,
+        dialect_label=_dialect_label(sql_dialect),
+        enable_nolock=str(bool(enable_nolock)).lower(),
+        relative_date_reference=_build_relative_date_reference(),
     )
     try:
         resp = llm.invoke(prompt)
         candidate = resp.content.strip() if hasattr(resp, "content") else str(resp).strip()
         candidate = _clean_sql_response(candidate)
-        candidate = fix_common_sql_errors(candidate)
+        candidate = fix_common_sql_errors(candidate, dialect=sql_dialect)
         valid, _ = validate_sql(candidate)
         if not valid:
             return sql
@@ -3048,45 +3196,53 @@ def _build_date_where_clauses(q: str, date_col_expr: str) -> List[str]:
     clauses: List[str] = []
     if not date_col_expr:
         return clauses
+    r = _get_ist_date_ranges()
 
     if "this month" in q:
-        month_start = "DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)"
-        clauses.append(f"{date_col_expr} >= {month_start}")
-        clauses.append(f"{date_col_expr} < DATEADD(MONTH, 1, {month_start})")
+        clauses.append(f"{date_col_expr} >= '{r['this_month_start']}'")
+        clauses.append(f"{date_col_expr} < '{r['this_month_end']}'")
     elif "last month" in q:
-        month_start = "DATEFROMPARTS(YEAR(DATEADD(MONTH, -1, GETDATE())), MONTH(DATEADD(MONTH, -1, GETDATE())), 1)"
-        clauses.append(f"{date_col_expr} >= {month_start}")
-        clauses.append(f"{date_col_expr} < DATEADD(MONTH, 1, {month_start})")
+        this_month_start = datetime.fromisoformat(r["this_month_start"]).date()
+        last_month_end = this_month_start
+        last_month_start = (last_month_end.replace(day=1) - timedelta(days=1)).replace(day=1)
+        clauses.append(f"{date_col_expr} >= '{last_month_start.isoformat()}'")
+        clauses.append(f"{date_col_expr} < '{last_month_end.isoformat()}'")
     elif "last week" in q:
-        # Monday-to-Sunday of the previous week (DATEPART WEEKDAY: 1=Sun..7=Sat)
-        clauses.append(f"{date_col_expr} >= DATEADD(DAY, -(DATEPART(WEEKDAY, CAST(GETDATE() AS DATE)) - 1) - 7, CAST(GETDATE() AS DATE))")
-        clauses.append(f"{date_col_expr} < DATEADD(DAY, -(DATEPART(WEEKDAY, CAST(GETDATE() AS DATE)) - 1), CAST(GETDATE() AS DATE))")
+        clauses.append(f"{date_col_expr} >= '{r['last_week_start']}'")
+        clauses.append(f"{date_col_expr} < '{r['last_week_end']}'")
     elif "this week" in q:
-        clauses.append(f"{date_col_expr} >= DATEADD(DAY, -(DATEPART(WEEKDAY, CAST(GETDATE() AS DATE)) - 1), CAST(GETDATE() AS DATE))")
-        clauses.append(f"{date_col_expr} < DATEADD(DAY, 7 - (DATEPART(WEEKDAY, CAST(GETDATE() AS DATE)) - 1), CAST(GETDATE() AS DATE))")
+        clauses.append(f"{date_col_expr} >= '{r['this_week_start']}'")
+        clauses.append(f"{date_col_expr} < '{r['this_week_end']}'")
     elif "yesterday" in q:
-        clauses.append(f"{date_col_expr} >= DATEADD(DAY, -1, CAST(GETDATE() AS DATE))")
-        clauses.append(f"{date_col_expr} < CAST(GETDATE() AS DATE)")
+        clauses.append(f"{date_col_expr} >= '{r['yesterday_start']}'")
+        clauses.append(f"{date_col_expr} < '{r['yesterday_end']}'")
     elif "today" in q:
-        clauses.append(f"{date_col_expr} >= CAST(GETDATE() AS DATE)")
-        clauses.append(f"{date_col_expr} < DATEADD(DAY, 1, CAST(GETDATE() AS DATE))")
+        clauses.append(f"{date_col_expr} >= '{r['today_start']}'")
+        clauses.append(f"{date_col_expr} < '{r['today_end']}'")
     elif "this year" in q:
-        clauses.append(f"{date_col_expr} >= DATEFROMPARTS(YEAR(GETDATE()), 1, 1)")
-        clauses.append(f"{date_col_expr} < DATEFROMPARTS(YEAR(GETDATE()) + 1, 1, 1)")
+        clauses.append(f"{date_col_expr} >= '{r['this_year_start']}'")
+        clauses.append(f"{date_col_expr} < '{r['this_year_end']}'")
     elif "last year" in q:
-        clauses.append(f"{date_col_expr} >= DATEFROMPARTS(YEAR(GETDATE()) - 1, 1, 1)")
-        clauses.append(f"{date_col_expr} < DATEFROMPARTS(YEAR(GETDATE()), 1, 1)")
+        this_year_start = datetime.fromisoformat(r["this_year_start"]).date()
+        last_year_start = this_year_start.replace(year=this_year_start.year - 1)
+        clauses.append(f"{date_col_expr} >= '{last_year_start.isoformat()}'")
+        clauses.append(f"{date_col_expr} < '{this_year_start.isoformat()}'")
     else:
         exact_date = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", q)
         if exact_date:
-            clauses.append(f"{date_col_expr} >= '{exact_date.group(1)}'")
-            clauses.append(f"{date_col_expr} < DATEADD(DAY, 1, '{exact_date.group(1)}')")
+            exact_start = datetime.fromisoformat(exact_date.group(1)).date()
+            exact_end = exact_start + timedelta(days=1)
+            clauses.append(f"{date_col_expr} >= '{exact_start.isoformat()}'")
+            clauses.append(f"{date_col_expr} < '{exact_end.isoformat()}'")
         else:
             last_n_days = re.search(r"last\s+(\d+)\s+days", q)
             if last_n_days:
                 n = max(1, min(int(last_n_days.group(1)), 365))
-                clauses.append(f"{date_col_expr} >= DATEADD(DAY, -{n}, CAST(GETDATE() AS DATE))")
-                clauses.append(f"{date_col_expr} < DATEADD(DAY, 1, CAST(GETDATE() AS DATE))")
+                today_start = datetime.fromisoformat(r["today_start"]).date()
+                start_date = today_start - timedelta(days=n)
+                end_date = today_start + timedelta(days=1)
+                clauses.append(f"{date_col_expr} >= '{start_date.isoformat()}'")
+                clauses.append(f"{date_col_expr} < '{end_date.isoformat()}'")
     return clauses
 
 
@@ -3710,6 +3866,168 @@ def _trim_conversation_context(context: str, max_turns: int = _MAX_CONTEXT_TURNS
         return "\n\n".join(turns) + "\n\n"
 
 
+_SESSION_QUERY_STATE: Dict[int, Dict[str, Any]] = {}
+
+
+def _new_session_query_state(dialect: str) -> Dict[str, Any]:
+    return {
+        # CHANGED: lightweight structured memory for follow-up quality.
+        "dialect": normalize_sql_dialect(dialect),
+        "last_sql": None,
+        "last_table": None,
+        "last_time_window": {"start": None, "end": None},
+        "last_dimensions": [],
+        "last_metrics": [],
+        "last_filters": [],
+    }
+
+
+def _get_session_query_state(chat_history: List[Dict], dialect: str) -> Dict[str, Any]:
+    key = id(chat_history)
+    state = _SESSION_QUERY_STATE.get(key)
+    if state is None:
+        state = _new_session_query_state(dialect)
+        _SESSION_QUERY_STATE[key] = state
+    else:
+        state["dialect"] = normalize_sql_dialect(dialect)
+    return state
+
+
+def _extract_sql_where_filters(sql: Optional[str]) -> List[str]:
+    if not sql:
+        return []
+    where_match = re.search(
+        r"(?is)\bWHERE\b\s*(.+?)(?:\bGROUP\s+BY\b|\bORDER\s+BY\b|\bHAVING\b|$)",
+        sql,
+    )
+    if not where_match:
+        return []
+    where_clause = " ".join(where_match.group(1).split())
+    parts = [p.strip() for p in re.split(r"(?i)\s+AND\s+", where_clause) if p.strip()]
+    return parts[:8]
+
+
+def _extract_sql_dimensions(sql: Optional[str]) -> List[str]:
+    if not sql:
+        return []
+    group_match = re.search(
+        r"(?is)\bGROUP\s+BY\b\s*(.+?)(?:\bORDER\s+BY\b|\bHAVING\b|$)",
+        sql,
+    )
+    if not group_match:
+        return []
+    dims = []
+    for raw in group_match.group(1).split(","):
+        val = " ".join(raw.strip().split())
+        if val:
+            dims.append(val)
+    return dims[:6]
+
+
+def _extract_sql_metrics(sql: Optional[str]) -> List[str]:
+    if not sql:
+        return []
+    metrics: List[str] = []
+    alias_matches = re.findall(r"(?i)\bAS\s+\[?([A-Za-z][A-Za-z0-9_ ]*)\]?", sql)
+    for alias in alias_matches:
+        alias_clean = " ".join(alias.strip().split())
+        if any(k in alias_clean.lower() for k in ("revenue", "sales", "cost", "profit", "booking", "avg", "count")):
+            metrics.append(alias_clean)
+    for func in re.findall(r"(?i)\b(sum|count|avg|min|max)\s*\(", sql):
+        metrics.append(func.upper())
+    seen = set()
+    deduped = []
+    for m in metrics:
+        key = m.lower()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(m)
+    return deduped[:6]
+
+
+def _extract_sql_time_window(sql: Optional[str]) -> Dict[str, Optional[str]]:
+    if not sql:
+        return {"start": None, "end": None}
+
+    # Prefer explicit paired range on the same column: col >= 'YYYY-MM-DD' AND col < 'YYYY-MM-DD'
+    pair_pattern = re.compile(
+        r"(?is)([A-Za-z_][A-Za-z0-9_\.\[\]]*)\s*>=\s*'(\d{4}-\d{2}-\d{2})'\s+AND\s+\1\s*<\s*'(\d{4}-\d{2}-\d{2})'"
+    )
+    pair_match = pair_pattern.search(sql)
+    if pair_match:
+        return {"start": pair_match.group(2), "end": pair_match.group(3)}
+
+    starts = re.findall(r"(?is)\b[A-Za-z_][A-Za-z0-9_\.\[\]]*\s*>=\s*'(\d{4}-\d{2}-\d{2})'", sql)
+    ends = re.findall(r"(?is)\b[A-Za-z_][A-Za-z0-9_\.\[\]]*\s*<\s*'(\d{4}-\d{2}-\d{2})'", sql)
+    return {
+        "start": starts[0] if starts else None,
+        "end": ends[0] if ends else None,
+    }
+
+
+def _extract_question_time_window(question: Optional[str]) -> Dict[str, Optional[str]]:
+    q = (question or "").lower()
+    r = _get_ist_date_ranges()
+    if "today" in q:
+        return {"start": r["today_start"], "end": r["today_end"]}
+    if "yesterday" in q:
+        return {"start": r["yesterday_start"], "end": r["yesterday_end"]}
+    if "this week" in q:
+        return {"start": r["this_week_start"], "end": r["this_week_end"]}
+    if "last week" in q:
+        return {"start": r["last_week_start"], "end": r["last_week_end"]}
+    if "this month" in q:
+        return {"start": r["this_month_start"], "end": r["this_month_end"]}
+    if "this year" in q:
+        return {"start": r["this_year_start"], "end": r["this_year_end"]}
+    date_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", q)
+    if date_match:
+        start = datetime.fromisoformat(date_match.group(1)).date()
+        end = start + timedelta(days=1)
+        return {"start": start.isoformat(), "end": end.isoformat()}
+    return {"start": None, "end": None}
+
+
+def _update_session_query_state(
+    state: Dict[str, Any],
+    sql: Optional[str],
+    dialect: str,
+    question: Optional[str] = None,
+) -> None:
+    if not state or not sql:
+        return
+    state["dialect"] = normalize_sql_dialect(dialect)
+    state["last_sql"] = sql
+    state["last_table"] = _extract_from_table_name(sql)
+    sql_window = _extract_sql_time_window(sql)
+    if not (sql_window.get("start") and sql_window.get("end")):
+        q_window = _extract_question_time_window(question)
+        if q_window.get("start") and q_window.get("end"):
+            sql_window = q_window
+    state["last_time_window"] = sql_window
+    state["last_dimensions"] = _extract_sql_dimensions(sql)
+    state["last_metrics"] = _extract_sql_metrics(sql)
+    state["last_filters"] = _extract_sql_where_filters(sql)
+
+
+def _build_prompt_context_from_state(
+    state: Dict[str, Any],
+    conversation_context: str,
+    conversation_turns: Optional[List[ConversationTurn]],
+) -> str:
+    # CHANGED: prompts now prioritize structured memory over long raw strings.
+    recent_text = ""
+    if conversation_context and conversation_context.strip():
+        trimmed = _trim_conversation_context(conversation_context, max_turns=2)
+        recent_text = trimmed[-700:]
+    elif conversation_turns:
+        recent_text = serialize_conversation_turns(conversation_turns, max_turns=2)[-700:]
+
+    structured_json = json.dumps(state, ensure_ascii=True)
+    recent_block = recent_text if recent_text else "none"
+    return f"STRUCTURED_STATE: {structured_json}\nRECENT_CONVERSATION: {recent_block}"
+
+
 # --- Main query handler ---
 
 def handle_query(
@@ -3726,12 +4044,22 @@ def handle_query(
     cached_schema_text: str = "",
     conversation_turns: Optional[List] = None,
     reasoning_llm=None,
+    sql_dialect: str = DEFAULT_SQL_DIALECT,
+    enable_nolock: bool = False,
 ) -> Dict[str, Any]:
     """
     Process a user question end-to-end.
     Returns dict with: intent, nl_answer, sql, results, row_count, from_cache, error, updated_context, conversation_turn
     """
     t_start = time.perf_counter()
+    active_dialect = normalize_sql_dialect(sql_dialect or _detect_sql_dialect_from_db(db))
+    dialect_label = _dialect_label(active_dialect)
+    relative_date_reference = _build_relative_date_reference()
+    nolock_setting = str(bool(enable_nolock)).lower()
+    session_state = _get_session_query_state(chat_history, active_dialect)
+
+    def _elapsed_seconds() -> float:
+        return time.perf_counter() - t_start
 
     # Step 1: Detect intent
     t_intent = time.perf_counter()
@@ -3769,7 +4097,7 @@ def handle_query(
         }
 
     # Step 3: Check for sort/filter follow-up
-    previous_sql = _get_last_sql(chat_history)
+    previous_sql = _get_last_sql(chat_history) or session_state.get("last_sql")
     previous_result_df = _get_last_result_df(chat_history)
 
     cleaned_query = None
@@ -3842,6 +4170,7 @@ def handle_query(
         if cached_sql is None:
             cached_sql, cached_df = find_cached_result(question, query_cache, embedder)
         if cached_sql is not None:
+            _update_session_query_state(session_state, cached_sql, active_dialect, question=question)
             results = cached_df.to_dict(orient="records") if cached_df is not None and len(cached_df) > 0 else []
             entry = _build_context_entry(question, cached_sql, len(results),
                                          list(cached_df.columns) if cached_df is not None else [],
@@ -3859,21 +4188,20 @@ def handle_query(
                 "nl_pending": True,
             }
 
-        # Build conversation context for the LLM.
-        # Prefer the string-based context (conversation_context) because _build_context_entry
-        # already embeds a SQL snippet, which is critical for follow-up query generation.
-        # Use structured turns only when the string context is empty (first query in session).
-        if conversation_context and conversation_context.strip():
-            trimmed_context = _trim_conversation_context(conversation_context)
-        elif conversation_turns:
-            trimmed_context = serialize_conversation_turns(conversation_turns, max_turns=3)
-        else:
-            trimmed_context = "No prior conversation."
+        # CHANGED: structured state is primary prompt memory; raw text is secondary.
+        prompt_context = _build_prompt_context_from_state(session_state, conversation_context, conversation_turns)
 
         t_sql_gen = time.perf_counter()
         # Retrieve few-shot examples from RAG for better SQL generation
         few_shot_str = ""
-        if rag_engine:
+        skip_rag_retrieval = bool(
+            is_sort_request
+            or is_filter_mod
+            or _is_short_contextual_followup(question)
+            or _is_bare_topn_followup(question)
+            or is_followup_question(question)
+        )
+        if rag_engine and not skip_rag_retrieval:
             try:
                 rag_context = rag_engine.retrieve(question, top_k=4)
                 examples = rag_context.get("examples", [])[:3]
@@ -3888,6 +4216,8 @@ def handle_query(
                     logger.info(f"Injected {len(examples)} few-shot examples from RAG")
             except Exception:
                 logger.warning("RAG retrieval failed for few-shot examples", exc_info=True)
+        elif rag_engine and skip_rag_retrieval:
+            logger.info("Skipped RAG retrieval for follow-up/short-context query")
 
         # ── Complexity-based LLM routing ──
         # deterministic → already handled above (no LLM call at all)
@@ -3901,6 +4231,10 @@ def handle_query(
             and not is_sort_request
             and not is_followup_filter
         )
+        if use_reasoning and _elapsed_seconds() > 2.0:
+            # CHANGED: latency budget guard (<5s target) — avoid slow reasoner on late path.
+            logger.info("Skipping reasoning_llm due to latency budget (>2s elapsed)")
+            use_reasoning = False
 
         try:
             if use_reasoning:
@@ -3908,9 +4242,12 @@ def handle_query(
                 reasoning_prompt = SQL_TEMPLATE.format(
                     full_schema=cached_schema_text or (db.get_table_info() if db else ""),
                     stored_procedure_guidance=stored_procedure_guidance,
-                    context=trimmed_context,
+                    context=prompt_context,
                     question=question,
                     few_shot_examples=few_shot_str,
+                    dialect_label=dialect_label,
+                    relative_date_reference=relative_date_reference,
+                    enable_nolock=nolock_setting,
                 )
                 reasoning_resp = reasoning_llm.invoke(reasoning_prompt)
                 raw_text = reasoning_resp.content.strip() if hasattr(reasoning_resp, "content") else str(reasoning_resp).strip()
@@ -3921,13 +4258,16 @@ def handle_query(
                 # Fast path: use standard chat model via pre-built chain
                 resp_text = sql_chain.invoke({
                     "question": question,
-                    "context": trimmed_context,
+                    "context": prompt_context,
                     "few_shot_examples": few_shot_str,
+                    "dialect_label": dialect_label,
+                    "relative_date_reference": relative_date_reference,
+                    "enable_nolock": nolock_setting,
                 })
                 logger.info(f"Fast chat model generated SQL ({(time.perf_counter()-t_sql_gen)*1000:.0f}ms), complexity={pre_complexity}")
 
             cleaned_query = _clean_sql_response(resp_text.strip())
-            cleaned_query = fix_common_sql_errors(cleaned_query)
+            cleaned_query = fix_common_sql_errors(cleaned_query, dialect=active_dialect)
             is_valid, validation_msg = validate_sql(cleaned_query)
             logger.info(f"SQL generated ({(time.perf_counter()-t_sql_gen)*1000:.0f}ms), valid={is_valid}, reasoning={use_reasoning}")
 
@@ -3937,14 +4277,17 @@ def handle_query(
                     question=question,
                     full_schema=cached_schema_text or (db.get_table_info() if db else ""),
                     stored_procedure_guidance=stored_procedure_guidance,
+                    dialect_label=dialect_label,
+                    relative_date_reference=relative_date_reference,
+                    enable_nolock=nolock_setting,
                 )
                 try:
-                    active_llm = reasoning_llm if reasoning_llm is not None else llm
+                    active_llm = reasoning_llm if (reasoning_llm is not None and _elapsed_seconds() <= 2.0) else llm
                     retry_resp = active_llm.invoke(retry_prompt)
                     retry_raw = retry_resp.content.strip() if hasattr(retry_resp, "content") else str(retry_resp).strip()
                     retry_raw = re.sub(r"<think>.*?</think>", "", retry_raw, flags=re.DOTALL).strip()
                     retry_sql = _clean_sql_response(retry_raw)
-                    retry_sql = fix_common_sql_errors(retry_sql)
+                    retry_sql = fix_common_sql_errors(retry_sql, dialect=active_dialect)
                     is_valid_retry, _ = validate_sql(retry_sql)
                     if is_valid_retry:
                         cleaned_query = retry_sql
@@ -3977,19 +4320,20 @@ def handle_query(
                             for c in bad_ids
                         )
                         id_fix_prompt = (
-                            f"Output ONLY a corrected SQL Server SELECT query. No markdown.\n"
+                            f"Return one corrected {_dialect_label(active_dialect)} SELECT query.\n"
                             f"The previous query incorrectly selected raw ID columns: {id_fix_pairs}.\n"
                             f"Replace each ID column with its human-readable name column, adding a JOIN if needed.\n\n"
                             f"SCHEMA:\n{cached_schema_text or (db.get_table_info() if db else '')}\n\n"
                             f"DOMAIN BUSINESS RULES:\n{stored_procedure_guidance}\n\n"
                             f"CURRENT SQL (fix it):\n{cleaned_query}\n\n"
+                            f"Output format: one SQL code block, optional Notes section.\n"
                             f"FIXED SQL:"
                         )
                         try:
                             fix_resp = llm.invoke(id_fix_prompt)
                             fix_sql = fix_resp.content.strip() if hasattr(fix_resp, "content") else str(fix_resp).strip()
                             fix_sql = _clean_sql_response(fix_sql)
-                            fix_sql = fix_common_sql_errors(fix_sql)
+                            fix_sql = fix_common_sql_errors(fix_sql, dialect=active_dialect)
                             fix_valid, _ = validate_sql(fix_sql)
                             if fix_valid:
                                 cleaned_query = fix_sql
@@ -4025,6 +4369,7 @@ def handle_query(
 
     # Step 4: Execute query
     if cleaned_query and is_valid:
+        cleaned_query = fix_common_sql_errors(cleaned_query, dialect=active_dialect)
         cleaned_query = expand_fuzzy_search(cleaned_query, db=db)
         cleaned_query = apply_stored_procedure_guardrails(cleaned_query, db=db)
         cleaned_query = _retry_ranking_shape_if_needed(
@@ -4033,9 +4378,20 @@ def handle_query(
             llm=llm,
             full_schema=cached_schema_text,
             stored_procedure_guidance=stored_procedure_guidance,
+            sql_dialect=active_dialect,
+            enable_nolock=enable_nolock,
         )
-        cleaned_query = optimize_sql_for_performance(cleaned_query)
-        cleaned_query = apply_query_performance_guardrails(cleaned_query, question=question, db=db)
+        cleaned_query = optimize_sql_for_performance(
+            cleaned_query,
+            dialect=active_dialect,
+            enable_nolock=enable_nolock,
+        )
+        cleaned_query = apply_query_performance_guardrails(
+            cleaned_query,
+            question=question,
+            db=db,
+            dialect=active_dialect,
+        )
 
         # Adjust timeout based on query complexity
         base_timeout = getattr(db_config, "query_timeout", 30)
@@ -4054,24 +4410,29 @@ def handle_query(
             logger.warning(f"SQL dry-run failed: {dry_err}")
             # Retry with error context
             retry_prompt = (
-                f"Output ONLY a corrected SQL Server SELECT query. No markdown.\n"
+                f"Return one corrected {_dialect_label(active_dialect)} SELECT query.\n"
                 f"The SQL below has this error: {dry_err}\n"
                 f"Fix the error while preserving the query intent.\n\n"
                 f"SCHEMA:\n{cached_schema_text or ''}\n\n"
                 f"BROKEN SQL:\n{cleaned_query}\n\n"
+                f"Output format: one SQL code block, optional Notes section.\n"
                 f"FIXED SQL:"
             )
             try:
-                active_llm = reasoning_llm if reasoning_llm is not None else llm
+                active_llm = reasoning_llm if (reasoning_llm is not None and _elapsed_seconds() <= 2.0) else llm
                 fix_resp = active_llm.invoke(retry_prompt)
                 fix_raw = fix_resp.content.strip() if hasattr(fix_resp, "content") else str(fix_resp).strip()
                 fix_raw = re.sub(r"<think>.*?</think>", "", fix_raw, flags=re.DOTALL).strip()
                 fix_sql = _clean_sql_response(fix_raw)
-                fix_sql = fix_common_sql_errors(fix_sql)
+                fix_sql = fix_common_sql_errors(fix_sql, dialect=active_dialect)
                 fix_valid, _ = validate_sql(fix_sql)
                 if fix_valid:
                     cleaned_query = fix_sql
-                    cleaned_query = optimize_sql_for_performance(cleaned_query)
+                    cleaned_query = optimize_sql_for_performance(
+                        cleaned_query,
+                        dialect=active_dialect,
+                        enable_nolock=enable_nolock,
+                    )
                     logger.info("SQL fixed after dry-run failure")
             except Exception:
                 logger.warning("LLM fix after dry-run failed", exc_info=True)
@@ -4086,8 +4447,26 @@ def handle_query(
         if error:
             # If follow-up filter caused an error or wrong columns, retry with cross-view search
             if is_followup_filter:
-                retry_result = _retry_followup_across_views(question, previous_sql, db, db_config, llm, query_cache, embedder, conversation_context, timeout_seconds)
+                retry_result = _retry_followup_across_views(
+                    question,
+                    previous_sql,
+                    db,
+                    db_config,
+                    llm,
+                    query_cache,
+                    embedder,
+                    conversation_context,
+                    timeout_seconds,
+                    sql_dialect=active_dialect,
+                    enable_nolock=enable_nolock,
+                )
                 if retry_result is not None:
+                    _update_session_query_state(
+                        session_state,
+                        retry_result.get("sql"),
+                        active_dialect,
+                        question=question,
+                    )
                     return retry_result
 
             entry = _build_context_entry(question, cleaned_query, 0, [], status="error")
@@ -4104,6 +4483,7 @@ def handle_query(
             }
 
         if df is not None and len(df) > 0:
+            _update_session_query_state(session_state, cleaned_query, active_dialect, question=question)
             cache_query_result(question, cleaned_query, df, query_cache, embedder)
             _GLOBAL_QUERY_CACHE.add(question, cleaned_query, df, embedder)
             results = df.to_dict(orient="records")
@@ -4129,10 +4509,29 @@ def handle_query(
         elif (df is None or len(df) == 0) and is_followup_filter and error is None:
             # Follow-up filter returned no results — the value likely belongs
             # to a different view. Retry with cross-view search.
-            retry_result = _retry_followup_across_views(question, previous_sql, db, db_config, llm, query_cache, embedder, conversation_context, timeout_seconds)
+            retry_result = _retry_followup_across_views(
+                question,
+                previous_sql,
+                db,
+                db_config,
+                llm,
+                query_cache,
+                embedder,
+                conversation_context,
+                timeout_seconds,
+                sql_dialect=active_dialect,
+                enable_nolock=enable_nolock,
+            )
             if retry_result is not None:
+                _update_session_query_state(
+                    session_state,
+                    retry_result.get("sql"),
+                    active_dialect,
+                    question=question,
+                )
                 return retry_result
             # Both attempts returned nothing
+            _update_session_query_state(session_state, cleaned_query, active_dialect, question=question)
             cache_query_result(question, cleaned_query, None, query_cache, embedder)
             entry = _build_context_entry(question, cleaned_query, 0, [], status="no_rows")
             new_context = _trim_conversation_context(conversation_context + entry)
@@ -4147,6 +4546,7 @@ def handle_query(
                 "updated_context": new_context,
             }
         else:
+            _update_session_query_state(session_state, cleaned_query, active_dialect, question=question)
             cache_query_result(question, cleaned_query, None, query_cache, embedder)
             entry = _build_context_entry(question, cleaned_query, 0, [], status="no_rows")
             new_context = _trim_conversation_context(conversation_context + entry)
@@ -4255,6 +4655,8 @@ def _retry_followup_across_views(
     embedder,
     conversation_context: str,
     timeout_seconds: int,
+    sql_dialect: str = DEFAULT_SQL_DIALECT,
+    enable_nolock: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """When a follow-up filter returns no results or errors, try searching across all views."""
     search_term = _extract_search_term(question)
@@ -4280,8 +4682,18 @@ def _retry_followup_across_views(
                 f"GROUP BY {group_by} "
                 f"ORDER BY revenue DESC"
             )
-            retry_sql = optimize_sql_for_performance(retry_sql)
-            retry_sql = apply_query_performance_guardrails(retry_sql, question=question, db=db)
+            retry_sql = fix_common_sql_errors(retry_sql, dialect=sql_dialect)
+            retry_sql = optimize_sql_for_performance(
+                retry_sql,
+                dialect=sql_dialect,
+                enable_nolock=enable_nolock,
+            )
+            retry_sql = apply_query_performance_guardrails(
+                retry_sql,
+                question=question,
+                db=db,
+                dialect=sql_dialect,
+            )
             retry_df, retry_error = execute_query_safe(db, retry_sql, timeout_seconds=timeout_seconds, max_rows=1000)
             if retry_df is not None and len(retry_df) > 0:
                 cache_query_result(question, retry_sql, retry_df, query_cache, embedder)

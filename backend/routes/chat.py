@@ -55,6 +55,8 @@ def query(req: QueryRequest, session: Session = Depends(get_session)):
         cached_schema_text=session.cached_schema_text,
         conversation_turns=session.conversation_turns,
         reasoning_llm=session.reasoning_llm,
+        sql_dialect=session.sql_dialect,
+        enable_nolock=session.enable_nolock,
     )
 
     # Update session state
