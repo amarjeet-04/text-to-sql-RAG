@@ -1,0 +1,218 @@
+{
+  "description": "Ground truth evaluation cases for Text-to-SQL RAG system (MSSQL syntax)",
+  "version": "3.0",
+  "created": "2026-02-19",
+  "tables": ["BookingData", "AgentMaster", "HotelData", "Master_City", "Master_Country", "HotelChain", "Master_HotelData", "SupplierMappingTable", "Master_ServiceType"],
+  "cases": [
+    {
+      "question": "What is the total revenue?",
+      "ground_truth_sql": "SELECT SUM(AgentSellingPrice) AS total_revenue FROM BookingData",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "Simple sum of selling price"
+    },
+    {
+      "question": "How many bookings are there in total?",
+      "ground_truth_sql": "SELECT COUNT(*) AS total_bookings FROM BookingData",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "Simple count of all bookings"
+    },
+    {
+      "question": "What is the average selling price per booking?",
+      "ground_truth_sql": "SELECT AVG(AgentSellingPrice) AS avg_selling_price FROM BookingData",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "Average selling price calculation"
+    },
+    {
+      "question": "Show total revenue by agent",
+      "ground_truth_sql": "SELECT a.AgentName, SUM(b.AgentSellingPrice) AS revenue FROM BookingData b JOIN AgentMaster a ON b.AgentId = a.AgentId GROUP BY a.AgentName ORDER BY revenue DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "Revenue aggregation by agent with JOIN"
+    },
+    {
+      "question": "Total bookings by country",
+      "ground_truth_sql": "SELECT mc.CountryName, COUNT(*) AS bookings FROM BookingData b JOIN Master_Country mc ON b.DestinationCountryId = mc.CountryId GROUP BY mc.CountryName ORDER BY bookings DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "Country-wise booking count"
+    },
+    {
+      "question": "Find bookings for India",
+      "ground_truth_sql": "SELECT COUNT(*) AS bookings, SUM(AgentSellingPrice) AS revenue FROM BookingData b JOIN Master_Country mc ON b.DestinationCountryId = mc.CountryId WHERE mc.CountryName LIKE '%India%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Text search on destination country"
+    },
+    {
+      "question": "Show all confirmed bookings",
+      "ground_truth_sql": "SELECT COUNT(*) AS confirmed_bookings, SUM(AgentSellingPrice) AS revenue FROM BookingData WHERE BookingStatus = 'Confirmed'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Filter by booking status"
+    },
+    {
+      "question": "Find bookings where selling price is greater than 10000",
+      "ground_truth_sql": "SELECT COUNT(*) AS booking_count, SUM(AgentSellingPrice) AS total_revenue FROM BookingData WHERE AgentSellingPrice > 10000",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Numeric filter on selling price"
+    },
+    {
+      "question": "Show bookings for Hilton hotel",
+      "ground_truth_sql": "SELECT COUNT(*) AS bookings, SUM(b.AgentSellingPrice) AS revenue FROM BookingData b JOIN HotelData h ON b.HotelId = h.HotelId WHERE h.HotelName LIKE '%Hilton%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Hotel name text search"
+    },
+    {
+      "question": "Show bookings from the last 30 days",
+      "ground_truth_sql": "SELECT COUNT(*) AS bookings, SUM(AgentSellingPrice) AS revenue FROM BookingData WHERE CreatedDate >= DATEADD(DAY, -30, GETDATE())",
+      "category": "date",
+      "difficulty": "medium",
+      "description": "Date range filter using DATEADD"
+    },
+    {
+      "question": "How many bookings were created this year?",
+      "ground_truth_sql": "SELECT COUNT(*) AS bookings_this_year FROM BookingData WHERE YEAR(CreatedDate) = YEAR(GETDATE())",
+      "category": "date",
+      "difficulty": "medium",
+      "description": "Year-based date filter"
+    },
+    {
+      "question": "Monthly booking trend this year",
+      "ground_truth_sql": "SELECT MONTH(CreatedDate) AS month, COUNT(*) AS bookings, SUM(AgentSellingPrice) AS revenue FROM BookingData WHERE YEAR(CreatedDate) = YEAR(GETDATE()) GROUP BY MONTH(CreatedDate) ORDER BY month",
+      "category": "date",
+      "difficulty": "medium",
+      "description": "Monthly aggregation with date functions"
+    },
+    {
+      "question": "What is the average stay duration per agent?",
+      "ground_truth_sql": "SELECT a.AgentName, AVG(DATEDIFF(DAY, b.CheckInDate, b.CheckOutDate)) AS avg_stay_days, COUNT(*) AS booking_count FROM BookingData b JOIN AgentMaster a ON b.AgentId = a.AgentId GROUP BY a.AgentName ORDER BY avg_stay_days DESC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "Average stay duration with DATEDIFF and JOIN"
+    },
+    {
+      "question": "Top 5 agents by revenue",
+      "ground_truth_sql": "SELECT TOP 5 a.AgentName, a.AgentCountry, SUM(b.AgentSellingPrice) AS revenue, COUNT(*) AS bookings FROM BookingData b JOIN AgentMaster a ON b.AgentId = a.AgentId GROUP BY a.AgentName, a.AgentCountry ORDER BY revenue DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "Top N agents by revenue"
+    },
+    {
+      "question": "Top 10 hotels by number of bookings",
+      "ground_truth_sql": "SELECT TOP 10 h.HotelName, COUNT(*) AS booking_count FROM BookingData b JOIN HotelData h ON b.HotelId = h.HotelId GROUP BY h.HotelName ORDER BY booking_count DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "Top N hotels by booking count"
+    },
+    {
+      "question": "Revenue by destination country",
+      "ground_truth_sql": "SELECT mc.CountryName, SUM(b.AgentSellingPrice) AS revenue, COUNT(*) AS bookings FROM BookingData b JOIN Master_Country mc ON b.DestinationCountryId = mc.CountryId GROUP BY mc.CountryName ORDER BY revenue DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "Revenue aggregation by destination country"
+    },
+    {
+      "question": "Show profit margin by product type",
+      "ground_truth_sql": "SELECT ProductName, SUM(AgentSellingPrice) AS revenue, SUM(CompanyBuyingPrice) AS cost, SUM(AgentSellingPrice) - SUM(CompanyBuyingPrice) AS profit FROM BookingData GROUP BY ProductName ORDER BY profit DESC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "Profit margin calculation by product"
+    },
+    {
+      "question": "Show agent performance summary",
+      "ground_truth_sql": "SELECT a.AgentName, COUNT(*) AS total_bookings, SUM(b.AgentSellingPrice) AS revenue, SUM(b.AgentSellingPrice) - SUM(b.CompanyBuyingPrice) AS profit FROM BookingData b JOIN AgentMaster a ON b.AgentId = a.AgentId GROUP BY a.AgentName ORDER BY revenue DESC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "Comprehensive agent metrics"
+    },
+    {
+      "question": "Show hotel chains with booking counts",
+      "ground_truth_sql": "SELECT TOP 20 hc.HotelChainName, COUNT(*) AS bookings, SUM(b.AgentSellingPrice) AS revenue FROM BookingData b JOIN HotelChain hc ON b.HotelChainId = hc.HotelChainId GROUP BY hc.HotelChainName ORDER BY bookings DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "Hotel chain booking breakdown"
+    },
+    {
+      "question": "Which city has the most bookings?",
+      "ground_truth_sql": "SELECT TOP 1 mc.CityName, COUNT(*) AS booking_count FROM BookingData b JOIN Master_City mc ON b.CityId = mc.CityId GROUP BY mc.CityName ORDER BY booking_count DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "City with highest booking count"
+    },
+    {
+      "question": "Show cancelled bookings with agent details",
+      "ground_truth_sql": "SELECT a.AgentName, a.AgentCountry, COUNT(*) AS cancelled_count, SUM(b.AgentSellingPrice) AS lost_revenue FROM BookingData b JOIN AgentMaster a ON b.AgentId = a.AgentId WHERE b.BookingStatus = 'Cancelled' GROUP BY a.AgentName, a.AgentCountry ORDER BY cancelled_count DESC",
+      "category": "filter",
+      "difficulty": "hard",
+      "description": "Cancelled bookings with agent JOIN and aggregation"
+    },
+    {
+      "question": "Show booking count by service type",
+      "ground_truth_sql": "SELECT st.ServiceTypeName, COUNT(*) AS bookings FROM BookingData b JOIN Master_ServiceType st ON b.ServiceTypeId = st.ServiceTypeId GROUP BY st.ServiceTypeName ORDER BY bookings DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "Booking count by service type"
+    },
+    {
+      "question": "Average booking value by agent country",
+      "ground_truth_sql": "SELECT a.AgentCountry, AVG(b.AgentSellingPrice) AS avg_value, COUNT(*) AS bookings FROM BookingData b JOIN AgentMaster a ON b.AgentId = a.AgentId GROUP BY a.AgentCountry ORDER BY avg_value DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "Average booking value by agent country"
+    },
+    {
+      "question": "Bookings last month by city",
+      "ground_truth_sql": "SELECT mc.CityName, COUNT(*) AS bookings, SUM(b.AgentSellingPrice) AS revenue FROM BookingData b JOIN Master_City mc ON b.CityId = mc.CityId WHERE MONTH(b.CreatedDate) = MONTH(DATEADD(MONTH, -1, GETDATE())) AND YEAR(b.CreatedDate) = YEAR(DATEADD(MONTH, -1, GETDATE())) GROUP BY mc.CityName ORDER BY bookings DESC",
+      "category": "filter",
+      "difficulty": "hard",
+      "description": "Date filter with city grouping"
+    },
+    {
+      "question": "Show bookings by check-in month",
+      "ground_truth_sql": "SELECT MONTH(CheckInDate) AS checkin_month, COUNT(*) AS bookings FROM BookingData GROUP BY MONTH(CheckInDate) ORDER BY checkin_month",
+      "category": "date",
+      "difficulty": "easy",
+      "description": "Booking distribution by check-in month"
+    },
+    {
+      "question": "Top 10 bookings by selling price",
+      "ground_truth_sql": "SELECT TOP 10 BookingId, ProductName, AgentSellingPrice, BookingStatus, CreatedDate FROM BookingData ORDER BY AgentSellingPrice DESC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "Top bookings by value"
+    },
+    {
+      "question": "Show total cost vs revenue",
+      "ground_truth_sql": "SELECT SUM(CompanyBuyingPrice) AS total_cost, SUM(AgentSellingPrice) AS total_revenue, SUM(AgentSellingPrice) - SUM(CompanyBuyingPrice) AS total_profit FROM BookingData",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "Overall cost vs revenue summary"
+    },
+    {
+      "question": "How many agents are there?",
+      "ground_truth_sql": "SELECT COUNT(*) AS total_agents FROM AgentMaster",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "Simple count of agents"
+    },
+    {
+      "question": "Show bookings where check-in date is in the next 7 days",
+      "ground_truth_sql": "SELECT COUNT(*) AS upcoming_bookings FROM BookingData WHERE CheckInDate BETWEEN GETDATE() AND DATEADD(DAY, 7, GETDATE())",
+      "category": "date",
+      "difficulty": "medium",
+      "description": "Upcoming check-in bookings"
+    },
+    {
+      "question": "Revenue breakdown by booking status",
+      "ground_truth_sql": "SELECT BookingStatus, COUNT(*) AS booking_count, SUM(AgentSellingPrice) AS revenue FROM BookingData GROUP BY BookingStatus ORDER BY revenue DESC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "Revenue by booking status"
+    }
+  ]
+}

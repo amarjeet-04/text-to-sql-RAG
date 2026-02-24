@@ -1,0 +1,1184 @@
+{
+  "description": "Ground truth evaluation cases for Text-to-SQL RAG system - MSSQL syntax (>=200 cases)",
+  "version": "5.0",
+  "created": "2026-02-19",
+  "total_cases": 220,
+  "cases": [
+    {
+      "id": 74,
+      "question": "Bottom 20 country by revenue for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       SUM(AgentSellingPrice) AS revenue\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY AgentCountry\nORDER BY revenue ASC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "bottom revenue grouped by country filtered by Confirmed"
+    },
+    {
+      "id": 75,
+      "question": "Top 20 country by profit for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       SUM(AgentSellingPrice - CompanyBuyingPrice) AS profit\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY AgentCountry\nORDER BY profit DESC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "top profit grouped by country filtered by Confirmed"
+    },
+    {
+      "id": 76,
+      "question": "Bottom 20 country by profit for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       SUM(AgentSellingPrice - CompanyBuyingPrice) AS profit\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY AgentCountry\nORDER BY profit ASC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "bottom profit grouped by country filtered by Confirmed"
+    },
+    {
+      "id": 77,
+      "question": "Top 20 country by bookings for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       COUNT(*) AS bookings\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY AgentCountry\nORDER BY bookings DESC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "top bookings grouped by country filtered by Confirmed"
+    },
+    {
+      "id": 78,
+      "question": "Bottom 20 country by bookings for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       COUNT(*) AS bookings\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY AgentCountry\nORDER BY bookings ASC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "bottom bookings grouped by country filtered by Confirmed"
+    },
+    {
+      "id": 79,
+      "question": "Top 20 country by avg_booking_value for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       AVG(AgentSellingPrice) AS avg_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY AgentCountry\nORDER BY avg_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "top avg_booking_value grouped by country filtered by Confirmed"
+    },
+    {
+      "id": 80,
+      "question": "Bottom 20 country by avg_booking_value for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       AVG(AgentSellingPrice) AS avg_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY AgentCountry\nORDER BY avg_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "bottom avg_booking_value grouped by country filtered by Confirmed"
+    },
+    {
+      "id": 81,
+      "question": "Top 20 country by min_booking_value for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       MIN(AgentSellingPrice) AS min_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY AgentCountry\nORDER BY min_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "top min_booking_value grouped by country filtered by Confirmed"
+    },
+    {
+      "id": 82,
+      "question": "Bottom 20 country by min_booking_value for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       MIN(AgentSellingPrice) AS min_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY AgentCountry\nORDER BY min_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "bottom min_booking_value grouped by country filtered by Confirmed"
+    },
+    {
+      "id": 83,
+      "question": "Top 20 country by max_booking_value for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       MAX(AgentSellingPrice) AS max_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY AgentCountry\nORDER BY max_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "top max_booking_value grouped by country filtered by Confirmed"
+    },
+    {
+      "id": 84,
+      "question": "Bottom 20 country by max_booking_value for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       MAX(AgentSellingPrice) AS max_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY AgentCountry\nORDER BY max_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "bottom max_booking_value grouped by country filtered by Confirmed"
+    },
+    {
+      "id": 85,
+      "question": "Top 20 country by revenue for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       SUM(AgentSellingPrice) AS revenue\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY AgentCountry\nORDER BY revenue DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "top revenue grouped by country filtered by Cancelled"
+    },
+    {
+      "id": 86,
+      "question": "Bottom 20 country by revenue for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       SUM(AgentSellingPrice) AS revenue\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY AgentCountry\nORDER BY revenue ASC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "bottom revenue grouped by country filtered by Cancelled"
+    },
+    {
+      "id": 87,
+      "question": "Top 20 country by profit for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       SUM(AgentSellingPrice - CompanyBuyingPrice) AS profit\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY AgentCountry\nORDER BY profit DESC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "top profit grouped by country filtered by Cancelled"
+    },
+    {
+      "id": 88,
+      "question": "Bottom 20 country by profit for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       SUM(AgentSellingPrice - CompanyBuyingPrice) AS profit\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY AgentCountry\nORDER BY profit ASC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "bottom profit grouped by country filtered by Cancelled"
+    },
+    {
+      "id": 89,
+      "question": "Top 20 country by bookings for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       COUNT(*) AS bookings\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY AgentCountry\nORDER BY bookings DESC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "top bookings grouped by country filtered by Cancelled"
+    },
+    {
+      "id": 90,
+      "question": "Bottom 20 country by bookings for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       COUNT(*) AS bookings\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY AgentCountry\nORDER BY bookings ASC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "bottom bookings grouped by country filtered by Cancelled"
+    },
+    {
+      "id": 91,
+      "question": "Top 20 country by avg_booking_value for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       AVG(AgentSellingPrice) AS avg_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY AgentCountry\nORDER BY avg_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "top avg_booking_value grouped by country filtered by Cancelled"
+    },
+    {
+      "id": 92,
+      "question": "Bottom 20 country by avg_booking_value for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       AVG(AgentSellingPrice) AS avg_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY AgentCountry\nORDER BY avg_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "bottom avg_booking_value grouped by country filtered by Cancelled"
+    },
+    {
+      "id": 93,
+      "question": "Top 20 country by min_booking_value for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       MIN(AgentSellingPrice) AS min_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY AgentCountry\nORDER BY min_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "top min_booking_value grouped by country filtered by Cancelled"
+    },
+    {
+      "id": 94,
+      "question": "Bottom 20 country by min_booking_value for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       MIN(AgentSellingPrice) AS min_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY AgentCountry\nORDER BY min_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "bottom min_booking_value grouped by country filtered by Cancelled"
+    },
+    {
+      "id": 95,
+      "question": "Top 20 country by max_booking_value for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       MAX(AgentSellingPrice) AS max_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY AgentCountry\nORDER BY max_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "top max_booking_value grouped by country filtered by Cancelled"
+    },
+    {
+      "id": 96,
+      "question": "Bottom 20 country by max_booking_value for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       MAX(AgentSellingPrice) AS max_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY AgentCountry\nORDER BY max_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "bottom max_booking_value grouped by country filtered by Cancelled"
+    },
+    {
+      "id": 97,
+      "question": "Top 20 country by revenue for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       SUM(AgentSellingPrice) AS revenue\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY AgentCountry\nORDER BY revenue DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "top revenue grouped by country filtered by Pending"
+    },
+    {
+      "id": 98,
+      "question": "Bottom 20 country by revenue for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       SUM(AgentSellingPrice) AS revenue\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY AgentCountry\nORDER BY revenue ASC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "bottom revenue grouped by country filtered by Pending"
+    },
+    {
+      "id": 99,
+      "question": "Top 20 country by profit for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       SUM(AgentSellingPrice - CompanyBuyingPrice) AS profit\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY AgentCountry\nORDER BY profit DESC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "top profit grouped by country filtered by Pending"
+    },
+    {
+      "id": 100,
+      "question": "Bottom 20 country by profit for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       SUM(AgentSellingPrice - CompanyBuyingPrice) AS profit\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY AgentCountry\nORDER BY profit ASC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "bottom profit grouped by country filtered by Pending"
+    },
+    {
+      "id": 101,
+      "question": "Top 20 country by bookings for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       COUNT(*) AS bookings\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY AgentCountry\nORDER BY bookings DESC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "top bookings grouped by country filtered by Pending"
+    },
+    {
+      "id": 102,
+      "question": "Bottom 20 country by bookings for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       COUNT(*) AS bookings\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY AgentCountry\nORDER BY bookings ASC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "bottom bookings grouped by country filtered by Pending"
+    },
+    {
+      "id": 103,
+      "question": "Top 20 country by avg_booking_value for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       AVG(AgentSellingPrice) AS avg_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY AgentCountry\nORDER BY avg_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "top avg_booking_value grouped by country filtered by Pending"
+    },
+    {
+      "id": 104,
+      "question": "Bottom 20 country by avg_booking_value for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       AVG(AgentSellingPrice) AS avg_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY AgentCountry\nORDER BY avg_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "bottom avg_booking_value grouped by country filtered by Pending"
+    },
+    {
+      "id": 105,
+      "question": "Top 20 country by min_booking_value for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       MIN(AgentSellingPrice) AS min_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY AgentCountry\nORDER BY min_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "top min_booking_value grouped by country filtered by Pending"
+    },
+    {
+      "id": 106,
+      "question": "Bottom 20 country by min_booking_value for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       MIN(AgentSellingPrice) AS min_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY AgentCountry\nORDER BY min_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "bottom min_booking_value grouped by country filtered by Pending"
+    },
+    {
+      "id": 107,
+      "question": "Top 20 country by max_booking_value for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       MAX(AgentSellingPrice) AS max_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY AgentCountry\nORDER BY max_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "top max_booking_value grouped by country filtered by Pending"
+    },
+    {
+      "id": 108,
+      "question": "Bottom 20 country by max_booking_value for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 AgentCountry,\n       MAX(AgentSellingPrice) AS max_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY AgentCountry\nORDER BY max_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "bottom max_booking_value grouped by country filtered by Pending"
+    },
+    {
+      "id": 109,
+      "question": "Top 20 suppliername by revenue for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       SUM(AgentSellingPrice) AS revenue\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY SupplierName\nORDER BY revenue DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "top revenue grouped by suppliername filtered by Confirmed"
+    },
+    {
+      "id": 110,
+      "question": "Bottom 20 suppliername by revenue for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       SUM(AgentSellingPrice) AS revenue\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY SupplierName\nORDER BY revenue ASC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "bottom revenue grouped by suppliername filtered by Confirmed"
+    },
+    {
+      "id": 111,
+      "question": "Top 20 suppliername by profit for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       SUM(AgentSellingPrice - CompanyBuyingPrice) AS profit\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY SupplierName\nORDER BY profit DESC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "top profit grouped by suppliername filtered by Confirmed"
+    },
+    {
+      "id": 112,
+      "question": "Bottom 20 suppliername by profit for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       SUM(AgentSellingPrice - CompanyBuyingPrice) AS profit\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY SupplierName\nORDER BY profit ASC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "bottom profit grouped by suppliername filtered by Confirmed"
+    },
+    {
+      "id": 113,
+      "question": "Top 20 suppliername by bookings for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       COUNT(*) AS bookings\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY SupplierName\nORDER BY bookings DESC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "top bookings grouped by suppliername filtered by Confirmed"
+    },
+    {
+      "id": 114,
+      "question": "Bottom 20 suppliername by bookings for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       COUNT(*) AS bookings\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY SupplierName\nORDER BY bookings ASC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "bottom bookings grouped by suppliername filtered by Confirmed"
+    },
+    {
+      "id": 115,
+      "question": "Top 20 suppliername by avg_booking_value for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       AVG(AgentSellingPrice) AS avg_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY SupplierName\nORDER BY avg_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "top avg_booking_value grouped by suppliername filtered by Confirmed"
+    },
+    {
+      "id": 116,
+      "question": "Bottom 20 suppliername by avg_booking_value for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       AVG(AgentSellingPrice) AS avg_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY SupplierName\nORDER BY avg_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "bottom avg_booking_value grouped by suppliername filtered by Confirmed"
+    },
+    {
+      "id": 117,
+      "question": "Top 20 suppliername by min_booking_value for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       MIN(AgentSellingPrice) AS min_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY SupplierName\nORDER BY min_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "top min_booking_value grouped by suppliername filtered by Confirmed"
+    },
+    {
+      "id": 118,
+      "question": "Bottom 20 suppliername by min_booking_value for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       MIN(AgentSellingPrice) AS min_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY SupplierName\nORDER BY min_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "bottom min_booking_value grouped by suppliername filtered by Confirmed"
+    },
+    {
+      "id": 119,
+      "question": "Top 20 suppliername by max_booking_value for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       MAX(AgentSellingPrice) AS max_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY SupplierName\nORDER BY max_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "top max_booking_value grouped by suppliername filtered by Confirmed"
+    },
+    {
+      "id": 120,
+      "question": "Bottom 20 suppliername by max_booking_value for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       MAX(AgentSellingPrice) AS max_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY SupplierName\nORDER BY max_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "bottom max_booking_value grouped by suppliername filtered by Confirmed"
+    },
+    {
+      "id": 121,
+      "question": "Top 20 suppliername by revenue for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       SUM(AgentSellingPrice) AS revenue\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY SupplierName\nORDER BY revenue DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "top revenue grouped by suppliername filtered by Cancelled"
+    },
+    {
+      "id": 122,
+      "question": "Bottom 20 suppliername by revenue for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       SUM(AgentSellingPrice) AS revenue\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY SupplierName\nORDER BY revenue ASC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "bottom revenue grouped by suppliername filtered by Cancelled"
+    },
+    {
+      "id": 123,
+      "question": "Top 20 suppliername by profit for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       SUM(AgentSellingPrice - CompanyBuyingPrice) AS profit\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY SupplierName\nORDER BY profit DESC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "top profit grouped by suppliername filtered by Cancelled"
+    },
+    {
+      "id": 124,
+      "question": "Bottom 20 suppliername by profit for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       SUM(AgentSellingPrice - CompanyBuyingPrice) AS profit\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY SupplierName\nORDER BY profit ASC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "bottom profit grouped by suppliername filtered by Cancelled"
+    },
+    {
+      "id": 125,
+      "question": "Top 20 suppliername by bookings for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       COUNT(*) AS bookings\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY SupplierName\nORDER BY bookings DESC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "top bookings grouped by suppliername filtered by Cancelled"
+    },
+    {
+      "id": 126,
+      "question": "Bottom 20 suppliername by bookings for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       COUNT(*) AS bookings\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY SupplierName\nORDER BY bookings ASC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "bottom bookings grouped by suppliername filtered by Cancelled"
+    },
+    {
+      "id": 127,
+      "question": "Top 20 suppliername by avg_booking_value for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       AVG(AgentSellingPrice) AS avg_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY SupplierName\nORDER BY avg_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "top avg_booking_value grouped by suppliername filtered by Cancelled"
+    },
+    {
+      "id": 128,
+      "question": "Bottom 20 suppliername by avg_booking_value for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       AVG(AgentSellingPrice) AS avg_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY SupplierName\nORDER BY avg_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "bottom avg_booking_value grouped by suppliername filtered by Cancelled"
+    },
+    {
+      "id": 129,
+      "question": "Top 20 suppliername by min_booking_value for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       MIN(AgentSellingPrice) AS min_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY SupplierName\nORDER BY min_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "top min_booking_value grouped by suppliername filtered by Cancelled"
+    },
+    {
+      "id": 130,
+      "question": "Bottom 20 suppliername by min_booking_value for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       MIN(AgentSellingPrice) AS min_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY SupplierName\nORDER BY min_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "bottom min_booking_value grouped by suppliername filtered by Cancelled"
+    },
+    {
+      "id": 131,
+      "question": "Top 20 suppliername by max_booking_value for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       MAX(AgentSellingPrice) AS max_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY SupplierName\nORDER BY max_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "top max_booking_value grouped by suppliername filtered by Cancelled"
+    },
+    {
+      "id": 132,
+      "question": "Bottom 20 suppliername by max_booking_value for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       MAX(AgentSellingPrice) AS max_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY SupplierName\nORDER BY max_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "bottom max_booking_value grouped by suppliername filtered by Cancelled"
+    },
+    {
+      "id": 133,
+      "question": "Top 20 suppliername by revenue for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       SUM(AgentSellingPrice) AS revenue\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY SupplierName\nORDER BY revenue DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "top revenue grouped by suppliername filtered by Pending"
+    },
+    {
+      "id": 134,
+      "question": "Bottom 20 suppliername by revenue for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       SUM(AgentSellingPrice) AS revenue\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY SupplierName\nORDER BY revenue ASC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "bottom revenue grouped by suppliername filtered by Pending"
+    },
+    {
+      "id": 135,
+      "question": "Top 20 suppliername by profit for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       SUM(AgentSellingPrice - CompanyBuyingPrice) AS profit\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY SupplierName\nORDER BY profit DESC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "top profit grouped by suppliername filtered by Pending"
+    },
+    {
+      "id": 136,
+      "question": "Bottom 20 suppliername by profit for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       SUM(AgentSellingPrice - CompanyBuyingPrice) AS profit\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY SupplierName\nORDER BY profit ASC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "bottom profit grouped by suppliername filtered by Pending"
+    },
+    {
+      "id": 137,
+      "question": "Top 20 suppliername by bookings for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       COUNT(*) AS bookings\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY SupplierName\nORDER BY bookings DESC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "top bookings grouped by suppliername filtered by Pending"
+    },
+    {
+      "id": 138,
+      "question": "Bottom 20 suppliername by bookings for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       COUNT(*) AS bookings\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY SupplierName\nORDER BY bookings ASC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "bottom bookings grouped by suppliername filtered by Pending"
+    },
+    {
+      "id": 139,
+      "question": "Top 20 suppliername by avg_booking_value for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       AVG(AgentSellingPrice) AS avg_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY SupplierName\nORDER BY avg_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "top avg_booking_value grouped by suppliername filtered by Pending"
+    },
+    {
+      "id": 140,
+      "question": "Bottom 20 suppliername by avg_booking_value for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       AVG(AgentSellingPrice) AS avg_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY SupplierName\nORDER BY avg_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "bottom avg_booking_value grouped by suppliername filtered by Pending"
+    },
+    {
+      "id": 141,
+      "question": "Top 20 suppliername by min_booking_value for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       MIN(AgentSellingPrice) AS min_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY SupplierName\nORDER BY min_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "top min_booking_value grouped by suppliername filtered by Pending"
+    },
+    {
+      "id": 142,
+      "question": "Bottom 20 suppliername by min_booking_value for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       MIN(AgentSellingPrice) AS min_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY SupplierName\nORDER BY min_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "bottom min_booking_value grouped by suppliername filtered by Pending"
+    },
+    {
+      "id": 143,
+      "question": "Top 20 suppliername by max_booking_value for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       MAX(AgentSellingPrice) AS max_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY SupplierName\nORDER BY max_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "top max_booking_value grouped by suppliername filtered by Pending"
+    },
+    {
+      "id": 144,
+      "question": "Bottom 20 suppliername by max_booking_value for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 SupplierName,\n       MAX(AgentSellingPrice) AS max_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY SupplierName\nORDER BY max_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "bottom max_booking_value grouped by suppliername filtered by Pending"
+    },
+    {
+      "id": 145,
+      "question": "Top 20 productname by revenue for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       SUM(AgentSellingPrice) AS revenue\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY ProductName\nORDER BY revenue DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "top revenue grouped by productname filtered by Confirmed"
+    },
+    {
+      "id": 146,
+      "question": "Bottom 20 productname by revenue for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       SUM(AgentSellingPrice) AS revenue\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY ProductName\nORDER BY revenue ASC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "bottom revenue grouped by productname filtered by Confirmed"
+    },
+    {
+      "id": 147,
+      "question": "Top 20 productname by profit for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       SUM(AgentSellingPrice - CompanyBuyingPrice) AS profit\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY ProductName\nORDER BY profit DESC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "top profit grouped by productname filtered by Confirmed"
+    },
+    {
+      "id": 148,
+      "question": "Bottom 20 productname by profit for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       SUM(AgentSellingPrice - CompanyBuyingPrice) AS profit\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY ProductName\nORDER BY profit ASC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "bottom profit grouped by productname filtered by Confirmed"
+    },
+    {
+      "id": 149,
+      "question": "Top 20 productname by bookings for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       COUNT(*) AS bookings\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY ProductName\nORDER BY bookings DESC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "top bookings grouped by productname filtered by Confirmed"
+    },
+    {
+      "id": 150,
+      "question": "Bottom 20 productname by bookings for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       COUNT(*) AS bookings\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY ProductName\nORDER BY bookings ASC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "bottom bookings grouped by productname filtered by Confirmed"
+    },
+    {
+      "id": 151,
+      "question": "Top 20 productname by avg_booking_value for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       AVG(AgentSellingPrice) AS avg_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY ProductName\nORDER BY avg_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "top avg_booking_value grouped by productname filtered by Confirmed"
+    },
+    {
+      "id": 152,
+      "question": "Bottom 20 productname by avg_booking_value for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       AVG(AgentSellingPrice) AS avg_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY ProductName\nORDER BY avg_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "bottom avg_booking_value grouped by productname filtered by Confirmed"
+    },
+    {
+      "id": 153,
+      "question": "Top 20 productname by min_booking_value for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       MIN(AgentSellingPrice) AS min_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY ProductName\nORDER BY min_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "top min_booking_value grouped by productname filtered by Confirmed"
+    },
+    {
+      "id": 154,
+      "question": "Bottom 20 productname by min_booking_value for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       MIN(AgentSellingPrice) AS min_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY ProductName\nORDER BY min_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "bottom min_booking_value grouped by productname filtered by Confirmed"
+    },
+    {
+      "id": 155,
+      "question": "Top 20 productname by max_booking_value for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       MAX(AgentSellingPrice) AS max_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY ProductName\nORDER BY max_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "top max_booking_value grouped by productname filtered by Confirmed"
+    },
+    {
+      "id": 156,
+      "question": "Bottom 20 productname by max_booking_value for confirmed bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       MAX(AgentSellingPrice) AS max_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Confirmed'\nGROUP BY ProductName\nORDER BY max_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "bottom max_booking_value grouped by productname filtered by Confirmed"
+    },
+    {
+      "id": 157,
+      "question": "Top 20 productname by revenue for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       SUM(AgentSellingPrice) AS revenue\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY ProductName\nORDER BY revenue DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "top revenue grouped by productname filtered by Cancelled"
+    },
+    {
+      "id": 158,
+      "question": "Bottom 20 productname by revenue for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       SUM(AgentSellingPrice) AS revenue\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY ProductName\nORDER BY revenue ASC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "bottom revenue grouped by productname filtered by Cancelled"
+    },
+    {
+      "id": 159,
+      "question": "Top 20 productname by profit for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       SUM(AgentSellingPrice - CompanyBuyingPrice) AS profit\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY ProductName\nORDER BY profit DESC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "top profit grouped by productname filtered by Cancelled"
+    },
+    {
+      "id": 160,
+      "question": "Bottom 20 productname by profit for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       SUM(AgentSellingPrice - CompanyBuyingPrice) AS profit\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY ProductName\nORDER BY profit ASC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "bottom profit grouped by productname filtered by Cancelled"
+    },
+    {
+      "id": 161,
+      "question": "Top 20 productname by bookings for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       COUNT(*) AS bookings\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY ProductName\nORDER BY bookings DESC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "top bookings grouped by productname filtered by Cancelled"
+    },
+    {
+      "id": 162,
+      "question": "Bottom 20 productname by bookings for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       COUNT(*) AS bookings\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY ProductName\nORDER BY bookings ASC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "bottom bookings grouped by productname filtered by Cancelled"
+    },
+    {
+      "id": 163,
+      "question": "Top 20 productname by avg_booking_value for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       AVG(AgentSellingPrice) AS avg_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY ProductName\nORDER BY avg_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "top avg_booking_value grouped by productname filtered by Cancelled"
+    },
+    {
+      "id": 164,
+      "question": "Bottom 20 productname by avg_booking_value for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       AVG(AgentSellingPrice) AS avg_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY ProductName\nORDER BY avg_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "bottom avg_booking_value grouped by productname filtered by Cancelled"
+    },
+    {
+      "id": 165,
+      "question": "Top 20 productname by min_booking_value for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       MIN(AgentSellingPrice) AS min_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY ProductName\nORDER BY min_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "top min_booking_value grouped by productname filtered by Cancelled"
+    },
+    {
+      "id": 166,
+      "question": "Bottom 20 productname by min_booking_value for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       MIN(AgentSellingPrice) AS min_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY ProductName\nORDER BY min_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "bottom min_booking_value grouped by productname filtered by Cancelled"
+    },
+    {
+      "id": 167,
+      "question": "Top 20 productname by max_booking_value for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       MAX(AgentSellingPrice) AS max_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY ProductName\nORDER BY max_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "top max_booking_value grouped by productname filtered by Cancelled"
+    },
+    {
+      "id": 168,
+      "question": "Bottom 20 productname by max_booking_value for cancelled bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       MAX(AgentSellingPrice) AS max_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Cancelled'\nGROUP BY ProductName\nORDER BY max_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "bottom max_booking_value grouped by productname filtered by Cancelled"
+    },
+    {
+      "id": 169,
+      "question": "Top 20 productname by revenue for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       SUM(AgentSellingPrice) AS revenue\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY ProductName\nORDER BY revenue DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "top revenue grouped by productname filtered by Pending"
+    },
+    {
+      "id": 170,
+      "question": "Bottom 20 productname by revenue for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       SUM(AgentSellingPrice) AS revenue\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY ProductName\nORDER BY revenue ASC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "bottom revenue grouped by productname filtered by Pending"
+    },
+    {
+      "id": 171,
+      "question": "Top 20 productname by profit for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       SUM(AgentSellingPrice - CompanyBuyingPrice) AS profit\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY ProductName\nORDER BY profit DESC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "top profit grouped by productname filtered by Pending"
+    },
+    {
+      "id": 172,
+      "question": "Bottom 20 productname by profit for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       SUM(AgentSellingPrice - CompanyBuyingPrice) AS profit\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY ProductName\nORDER BY profit ASC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "bottom profit grouped by productname filtered by Pending"
+    },
+    {
+      "id": 173,
+      "question": "Top 20 productname by bookings for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       COUNT(*) AS bookings\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY ProductName\nORDER BY bookings DESC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "top bookings grouped by productname filtered by Pending"
+    },
+    {
+      "id": 174,
+      "question": "Bottom 20 productname by bookings for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       COUNT(*) AS bookings\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY ProductName\nORDER BY bookings ASC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "bottom bookings grouped by productname filtered by Pending"
+    },
+    {
+      "id": 175,
+      "question": "Top 20 productname by avg_booking_value for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       AVG(AgentSellingPrice) AS avg_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY ProductName\nORDER BY avg_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "top avg_booking_value grouped by productname filtered by Pending"
+    },
+    {
+      "id": 176,
+      "question": "Bottom 20 productname by avg_booking_value for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       AVG(AgentSellingPrice) AS avg_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY ProductName\nORDER BY avg_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "bottom avg_booking_value grouped by productname filtered by Pending"
+    },
+    {
+      "id": 177,
+      "question": "Top 20 productname by min_booking_value for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       MIN(AgentSellingPrice) AS min_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY ProductName\nORDER BY min_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "top min_booking_value grouped by productname filtered by Pending"
+    },
+    {
+      "id": 178,
+      "question": "Bottom 20 productname by min_booking_value for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       MIN(AgentSellingPrice) AS min_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY ProductName\nORDER BY min_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "medium",
+      "description": "bottom min_booking_value grouped by productname filtered by Pending"
+    },
+    {
+      "id": 179,
+      "question": "Top 20 productname by max_booking_value for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       MAX(AgentSellingPrice) AS max_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY ProductName\nORDER BY max_booking_value DESC",
+      "category": "aggregation",
+      "difficulty": "hard",
+      "description": "top max_booking_value grouped by productname filtered by Pending"
+    },
+    {
+      "id": 180,
+      "question": "Bottom 20 productname by max_booking_value for pending bookings",
+      "ground_truth_sql": "SELECT TOP 20 ProductName,\n       MAX(AgentSellingPrice) AS max_booking_value\nFROM BookingData\nWHERE BookingStatus = 'Pending'\nGROUP BY ProductName\nORDER BY max_booking_value ASC",
+      "category": "aggregation",
+      "difficulty": "easy",
+      "description": "bottom max_booking_value grouped by productname filtered by Pending"
+    },
+    {
+      "id": 181,
+      "question": "Find bookings where supplier name contains india",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE SupplierName LIKE '%india%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Supplier text search"
+    },
+    {
+      "id": 182,
+      "question": "Find bookings where product name contains india",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE ProductName LIKE '%india%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Product text search"
+    },
+    {
+      "id": 183,
+      "question": "Find bookings where country contains india",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE AgentCountry LIKE '%india%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Country text search"
+    },
+    {
+      "id": 184,
+      "question": "Find bookings where supplier name contains hilton",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE SupplierName LIKE '%hilton%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Supplier text search"
+    },
+    {
+      "id": 185,
+      "question": "Find bookings where product name contains hilton",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE ProductName LIKE '%hilton%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Product text search"
+    },
+    {
+      "id": 186,
+      "question": "Find bookings where country contains hilton",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE AgentCountry LIKE '%hilton%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Country text search"
+    },
+    {
+      "id": 187,
+      "question": "Find bookings where supplier name contains marriott",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE SupplierName LIKE '%marriott%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Supplier text search"
+    },
+    {
+      "id": 188,
+      "question": "Find bookings where product name contains marriott",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE ProductName LIKE '%marriott%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Product text search"
+    },
+    {
+      "id": 189,
+      "question": "Find bookings where country contains marriott",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE AgentCountry LIKE '%marriott%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Country text search"
+    },
+    {
+      "id": 190,
+      "question": "Find bookings where supplier name contains dubai",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE SupplierName LIKE '%dubai%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Supplier text search"
+    },
+    {
+      "id": 191,
+      "question": "Find bookings where product name contains dubai",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE ProductName LIKE '%dubai%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Product text search"
+    },
+    {
+      "id": 192,
+      "question": "Find bookings where country contains dubai",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE AgentCountry LIKE '%dubai%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Country text search"
+    },
+    {
+      "id": 193,
+      "question": "Find bookings where supplier name contains paris",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE SupplierName LIKE '%paris%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Supplier text search"
+    },
+    {
+      "id": 194,
+      "question": "Find bookings where product name contains paris",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE ProductName LIKE '%paris%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Product text search"
+    },
+    {
+      "id": 195,
+      "question": "Find bookings where country contains paris",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE AgentCountry LIKE '%paris%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Country text search"
+    },
+    {
+      "id": 196,
+      "question": "Find bookings where supplier name contains london",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE SupplierName LIKE '%london%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Supplier text search"
+    },
+    {
+      "id": 197,
+      "question": "Find bookings where product name contains london",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE ProductName LIKE '%london%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Product text search"
+    },
+    {
+      "id": 198,
+      "question": "Find bookings where country contains london",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE AgentCountry LIKE '%london%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Country text search"
+    },
+    {
+      "id": 199,
+      "question": "Find bookings where supplier name contains singapore",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE SupplierName LIKE '%singapore%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Supplier text search"
+    },
+    {
+      "id": 200,
+      "question": "Find bookings where product name contains singapore",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE ProductName LIKE '%singapore%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Product text search"
+    },
+    {
+      "id": 201,
+      "question": "Find bookings where country contains singapore",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE AgentCountry LIKE '%singapore%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Country text search"
+    },
+    {
+      "id": 202,
+      "question": "Find bookings where supplier name contains rome",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE SupplierName LIKE '%rome%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Supplier text search"
+    },
+    {
+      "id": 203,
+      "question": "Find bookings where product name contains rome",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE ProductName LIKE '%rome%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Product text search"
+    },
+    {
+      "id": 204,
+      "question": "Find bookings where country contains rome",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE AgentCountry LIKE '%rome%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Country text search"
+    },
+    {
+      "id": 205,
+      "question": "Find bookings where supplier name contains bangkok",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE SupplierName LIKE '%bangkok%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Supplier text search"
+    },
+    {
+      "id": 206,
+      "question": "Find bookings where product name contains bangkok",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE ProductName LIKE '%bangkok%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Product text search"
+    },
+    {
+      "id": 207,
+      "question": "Find bookings where country contains bangkok",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE AgentCountry LIKE '%bangkok%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Country text search"
+    },
+    {
+      "id": 208,
+      "question": "Find bookings where supplier name contains new york",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE SupplierName LIKE '%new york%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Supplier text search"
+    },
+    {
+      "id": 209,
+      "question": "Find bookings where product name contains new york",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE ProductName LIKE '%new york%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Product text search"
+    },
+    {
+      "id": 210,
+      "question": "Find bookings where country contains new york",
+      "ground_truth_sql": "SELECT TOP 100 * FROM BookingData WHERE AgentCountry LIKE '%new york%'",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Country text search"
+    },
+    {
+      "id": 211,
+      "question": "Show confirmed bookings with selling price greater than 50",
+      "ground_truth_sql": "SELECT TOP 100 *\nFROM BookingData\nWHERE BookingStatus='Confirmed'\n  AND AgentSellingPrice > 50\nORDER BY AgentSellingPrice DESC",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Price threshold filter"
+    },
+    {
+      "id": 212,
+      "question": "Show confirmed bookings with profit greater than 50",
+      "ground_truth_sql": "SELECT TOP 100 *\nFROM BookingData\nWHERE BookingStatus='Confirmed'\n  AND (AgentSellingPrice - CompanyBuyingPrice) > 50\nORDER BY (AgentSellingPrice - CompanyBuyingPrice) DESC",
+      "category": "filter",
+      "difficulty": "medium",
+      "description": "Profit threshold filter"
+    },
+    {
+      "id": 213,
+      "question": "Show confirmed bookings with selling price greater than 100",
+      "ground_truth_sql": "SELECT TOP 100 *\nFROM BookingData\nWHERE BookingStatus='Confirmed'\n  AND AgentSellingPrice > 100\nORDER BY AgentSellingPrice DESC",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Price threshold filter"
+    },
+    {
+      "id": 214,
+      "question": "Show confirmed bookings with profit greater than 100",
+      "ground_truth_sql": "SELECT TOP 100 *\nFROM BookingData\nWHERE BookingStatus='Confirmed'\n  AND (AgentSellingPrice - CompanyBuyingPrice) > 100\nORDER BY (AgentSellingPrice - CompanyBuyingPrice) DESC",
+      "category": "filter",
+      "difficulty": "medium",
+      "description": "Profit threshold filter"
+    },
+    {
+      "id": 215,
+      "question": "Show confirmed bookings with selling price greater than 150",
+      "ground_truth_sql": "SELECT TOP 100 *\nFROM BookingData\nWHERE BookingStatus='Confirmed'\n  AND AgentSellingPrice > 150\nORDER BY AgentSellingPrice DESC",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Price threshold filter"
+    },
+    {
+      "id": 216,
+      "question": "Show confirmed bookings with profit greater than 150",
+      "ground_truth_sql": "SELECT TOP 100 *\nFROM BookingData\nWHERE BookingStatus='Confirmed'\n  AND (AgentSellingPrice - CompanyBuyingPrice) > 150\nORDER BY (AgentSellingPrice - CompanyBuyingPrice) DESC",
+      "category": "filter",
+      "difficulty": "medium",
+      "description": "Profit threshold filter"
+    },
+    {
+      "id": 217,
+      "question": "Show confirmed bookings with selling price greater than 250",
+      "ground_truth_sql": "SELECT TOP 100 *\nFROM BookingData\nWHERE BookingStatus='Confirmed'\n  AND AgentSellingPrice > 250\nORDER BY AgentSellingPrice DESC",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Price threshold filter"
+    },
+    {
+      "id": 218,
+      "question": "Show confirmed bookings with profit greater than 250",
+      "ground_truth_sql": "SELECT TOP 100 *\nFROM BookingData\nWHERE BookingStatus='Confirmed'\n  AND (AgentSellingPrice - CompanyBuyingPrice) > 250\nORDER BY (AgentSellingPrice - CompanyBuyingPrice) DESC",
+      "category": "filter",
+      "difficulty": "medium",
+      "description": "Profit threshold filter"
+    },
+    {
+      "id": 219,
+      "question": "Show confirmed bookings with selling price greater than 500",
+      "ground_truth_sql": "SELECT TOP 100 *\nFROM BookingData\nWHERE BookingStatus='Confirmed'\n  AND AgentSellingPrice > 500\nORDER BY AgentSellingPrice DESC",
+      "category": "filter",
+      "difficulty": "easy",
+      "description": "Price threshold filter"
+    },
+    {
+      "id": 220,
+      "question": "Show confirmed bookings with profit greater than 500",
+      "ground_truth_sql": "SELECT TOP 100 *\nFROM BookingData\nWHERE BookingStatus='Confirmed'\n  AND (AgentSellingPrice - CompanyBuyingPrice) > 500\nORDER BY (AgentSellingPrice - CompanyBuyingPrice) DESC",
+      "category": "filter",
+      "difficulty": "medium",
+      "description": "Profit threshold filter"
+    }
+  ]
+}

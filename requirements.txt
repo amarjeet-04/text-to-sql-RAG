@@ -1,0 +1,28 @@
+# FastAPI
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.6.0
+
+# LLM
+openai==1.12.0
+
+# HTTP client (pinned for OpenAI compatibility)
+httpx<0.28
+
+# RAG / Embeddings (optional but recommended)
+sentence-transformers==2.3.1
+numpy==1.26.3
+langchain==0.1.16
+langchain-community==0.0.32
+faiss-cpu==1.7.4
+pinecone>=5.0.0,<6
+streamlit==1.30.0
+
+
+# Database (optional)
+pymssql==2.3.13
+pyodbc>=5.0.1
+
+# Utilities
+python-dotenv==1.0.0
+requests==2.31.0

@@ -1,0 +1,55 @@
+"""
+FastAPI backend for Text-to-SQL RAG chatbot.
+Run with: uvicorn backend.main:app --reload --port 8000
+"""
+import sys
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Ensure project root is importable
+sys.path.insert(0, str(Path(__file__).parent.parent))
+load_dotenv(Path(__file__).parent.parent / ".env")
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from backend.routes.auth import router as auth_router
+from backend.routes.database import router as db_router
+from backend.routes.chat import router as chat_router
+from backend.routes.evaluation import router as eval_router
+
+app = FastAPI(title="Within Earth Chatbot API", version="1.0.0")
+
+
+@app.on_event("startup")
+def preload_embedder():
+    """Pre-load the sentence-transformers model at startup so /connect is fast."""
+    should_preload = os.getenv("PRELOAD_EMBEDDER", "false").lower() in {"1", "true", "yes", "on"}
+    if not should_preload:
+        return
+    from app.rag.rag_engine import RAGEngine
+    try:
+        RAGEngine()
+    except Exception:
+        # Keep API startup resilient if embedding dependencies are unavailable.
+        pass
+
+# CORS for React dev server
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(auth_router)
+app.include_router(db_router)
+app.include_router(chat_router)
+app.include_router(eval_router)
+
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok"}
