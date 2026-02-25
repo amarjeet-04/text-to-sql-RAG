@@ -145,6 +145,41 @@ export LLM_PROVIDER=openai   # or 'ollama'
 export LLM_MODEL=gpt-4       # or 'llama3'
 ```
 
+### 2.1 Cache and Runtime Settings
+```bash
+# Thread pool for background cache writes + LLM timeout execution
+export APP_THREADPOOL_MAX_WORKERS=8
+export APP_FOREGROUND_MAX_WORKERS=4
+
+# Schema cache
+export SCHEMA_CACHE_TTL_SECONDS=21600
+export SCHEMA_CACHE_MAX_ENTRIES=32
+
+# RAG retrieval cache
+export RAG_CACHE_TTL_SECONDS=900
+export RAG_CACHE_MAX_ENTRIES=256
+
+# Query-result cache (exact-match first, semantic fallback optional)
+export QUERY_CACHE_TTL_SECONDS=300
+export QUERY_CACHE_MAX_SIZE=300
+export QUERY_CACHE_ENABLE_SEMANTIC=false
+export QUERY_CACHE_SEMANTIC_THRESHOLD=0.97
+export QUERY_RESULT_RELATIVE_TTL_SECONDS=60
+export QUERY_CACHE_ENABLE_FRESHNESS_MARKER=true
+
+# DB transient retry (timeouts/network hiccups only)
+export DB_TRANSIENT_RETRIES=1
+export DB_TRANSIENT_RETRY_BACKOFF_SECONDS=0.2
+
+# Guarded pipeline timeouts (pre-DB gate path)
+export GUARDED_PIPELINE_BUDGET_S=12
+export GUARDED_INTENT_TIMEOUT_S=2.0
+export GUARDED_SQL_TIMEOUT_S=6.0
+export GUARDED_EVAL_TIMEOUT_S=1.8
+export GUARDED_FIX_TIMEOUT_S=2.5
+export GUARDED_SCHEMA_CHAR_BUDGET=16000
+```
+
 ### 3. Run
 ```bash
 uvicorn app.main:app --reload --port 8000

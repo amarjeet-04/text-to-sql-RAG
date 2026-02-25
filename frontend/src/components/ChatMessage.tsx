@@ -19,6 +19,12 @@ interface Props {
 
 export default function ChatMessage({ entry }: Props) {
   const { question, response } = entry;
+  const stageTiming = response.timing ?? null;
+  const timingItems = stageTiming
+    ? Object.entries(stageTiming)
+        .filter(([stage]) => stage !== 'start')
+        .map(([stage, ms]) => ({ stage, ms }))
+    : [];
 
   return (
     <div style={{ marginBottom: 24 }}>
@@ -67,7 +73,7 @@ export default function ChatMessage({ entry }: Props) {
           {response.nl_answer && (
             <Paragraph style={{ marginBottom: 8 }}>{response.nl_answer}</Paragraph>
           )}
-          {!response.nl_answer && response.nl_pending && (
+          {response.nl_pending && (
             <Paragraph type="secondary" style={{ marginBottom: 8 }}>
               <Spin indicator={<LoadingOutlined style={{ fontSize: 12 }} spin />} size="small" />{' '}
               Generating summary...
@@ -110,6 +116,42 @@ export default function ChatMessage({ entry }: Props) {
                     >
                       {response.sql}
                     </SyntaxHighlighter>
+                  ),
+                },
+              ]}
+            />
+          )}
+
+          {timingItems.length > 0 && (
+            <Collapse
+              size="small"
+              style={{ marginBottom: 8 }}
+              items={[
+                {
+                  key: 'timing',
+                  label: (
+                    <Space size={4}>
+                      <ThunderboltOutlined />
+                      <span>Stage Timing (ms)</span>
+                    </Space>
+                  ),
+                  children: (
+                    <div style={{ fontSize: 12 }}>
+                      {timingItems.map((item) => (
+                        <div
+                          key={item.stage}
+                          style={{
+                            display: 'flex',
+                            justifyContent: 'space-between',
+                            gap: 12,
+                            padding: '2px 0',
+                          }}
+                        >
+                          <Text type="secondary">{item.stage}</Text>
+                          <Text code>{item.ms.toFixed(2)}</Text>
+                        </div>
+                      ))}
+                    </div>
                   ),
                 },
               ]}
