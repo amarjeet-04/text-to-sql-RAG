@@ -16,16 +16,54 @@ from datetime import datetime
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
-USERS_DB = {
+_users_lock = threading.RLock()
+
+USERS_DB: Dict[str, Dict[str, str]] = {
     "admin":   {"password": hashlib.sha256(b"admin123").hexdigest(),   "role": "Admin",   "name": "Administrator"},
     "analyst": {"password": hashlib.sha256(b"analyst123").hexdigest(), "role": "Analyst", "name": "User"},
 }
 
+
 def verify_user(username: str, password: str) -> Optional[Dict[str, str]]:
-    row = USERS_DB.get(username)
+    with _users_lock:
+        row = USERS_DB.get(username)
     if row and row["password"] == hashlib.sha256(password.encode()).hexdigest():
         return {"username": username, "role": row["role"], "name": row["name"]}
     return None
+
+
+def register_user(username: str, password: str, role: str = "Analyst", name: str = "") -> Dict[str, str]:
+    """Register a new user. Raises ValueError if username is already taken."""
+    with _users_lock:
+        if username in USERS_DB:
+            raise ValueError("Username already taken")
+        USERS_DB[username] = {
+            "password": hashlib.sha256(password.encode()).hexdigest(),
+            "role": role,
+            "name": name or username,
+        }
+    return {"username": username, "role": role, "name": name or username}
+
+
+def list_users() -> List[Dict[str, str]]:
+    """Return all users (without passwords)."""
+    with _users_lock:
+        return [
+            {"username": u, "role": d["role"], "name": d["name"]}
+            for u, d in USERS_DB.items()
+        ]
+
+
+def delete_user(username: str) -> None:
+    """Delete a user. Raises ValueError if user not found or is the last admin."""
+    with _users_lock:
+        if username not in USERS_DB:
+            raise ValueError("User not found")
+        # Prevent deleting the last Admin
+        admins = [u for u, d in USERS_DB.items() if d["role"] == "Admin"]
+        if USERS_DB[username]["role"] == "Admin" and len(admins) <= 1:
+            raise ValueError("Cannot delete the last admin account")
+        del USERS_DB[username]
 
 
 # ---------------------------------------------------------------------------

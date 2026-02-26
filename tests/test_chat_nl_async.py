@@ -69,7 +69,6 @@ def test_nl_stream_ready_emits_done_event():
 
 def test_query_starts_server_side_nl_generation(monkeypatch):
     session = _make_session()
-    monkeypatch.setattr(chat_route, "USE_GUARDED_PIPELINE", False)
 
     def _fake_handle_query(**kwargs):
         return {
@@ -115,4 +114,51 @@ def test_query_starts_server_side_nl_generation(monkeypatch):
     assert status is not None
     assert status["status"] == "ready"
     assert status["nl_answer"] == "background summary"
+    store.delete(session.token)
+
+
+def test_query_timing_includes_all_stage_keys(monkeypatch):
+    session = _make_session()
+    monkeypatch.setattr(chat_route, "detect_intent_simple", lambda _q: "DATA_QUERY")
+
+    def _fake_handle_query(**kwargs):
+        return {
+            "intent": "DATA_QUERY",
+            "nl_answer": None,
+            "sql": "SELECT 1 AS v",
+            "results": [{"v": 1}],
+            "row_count": 1,
+            "from_cache": False,
+            "error": None,
+            "updated_state": {},
+            "nl_pending": False,
+            "fallback_used": False,
+            "timing": {"total": 12.3},
+        }
+
+    monkeypatch.setattr(chat_route, "legacy_handle_query", _fake_handle_query)
+
+    resp = client.post(
+        "/api/chat/query",
+        headers={"Authorization": f"Bearer {session.token}"},
+        json={"question": "show revenue"},
+    )
+    assert resp.status_code == 200
+    timing = resp.json().get("timing") or {}
+    expected_stages = [
+        "start",
+        "intent_detection",
+        "schema_loading",
+        "stored_procedure_guidance",
+        "cache_lookup",
+        "rag_retrieval",
+        "sql_generation",
+        "sql_validation",
+        "guardrails_applied",
+        "db_execution",
+        "results_formatting",
+        "total",
+    ]
+    for stage in expected_stages:
+        assert stage in timing
     store.delete(session.token)

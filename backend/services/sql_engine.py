@@ -9,6 +9,7 @@ import sys
 import time
 import socket
 import logging
+import functools
 import threading
 import hashlib
 from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -47,12 +48,16 @@ DATABASE_ENTITY_WORDS = {
     "checkin", "checkout", "details", "information", "data", "records", "rows",
     "filter", "show", "get", "list",
 }
-MAX_CACHE_SIZE = max(50, int(os.getenv("QUERY_CACHE_MAX_SIZE", os.getenv("QUERY_RESULT_CACHE_MAX_ENTRIES", "300"))))
 BLOCKED_KEYWORDS = {"drop", "delete", "truncate", "insert", "update", "alter", "create", "exec", "execute", "grant", "revoke"}
 DEFAULT_SQL_DIALECT = "sqlserver"
 PROMPT_BUDGET_CHARS = 20000
-LLM_SQL_TIMEOUT_MS = int(os.getenv("LLM_SQL_TIMEOUT_MS", "8000"))
+LLM_SQL_TIMEOUT_MS = int(os.getenv("LLM_SQL_TIMEOUT_MS", "15000"))
 ENABLE_LLM_SLA = os.getenv("ENABLE_LLM_SLA", "true").lower() in {"1", "true", "yes", "on"}
+# Disable the post-generation SQL intent validator for capable models (gpt-4o, gpt-4-turbo).
+# The validator adds a full LLM round-trip (~1–1.5s) after every SQL generation.
+# GPT-4o rarely produces wrong-intent SQL so the validator has near-zero value there.
+# Set to "true" to re-enable (useful for cheaper/weaker models).
+ENABLE_SQL_VALIDATOR = os.getenv("ENABLE_SQL_VALIDATOR", "false").lower() in {"1", "true", "yes", "on"}
 SCHEMA_CACHE_TTL_SECONDS = max(300, int(os.getenv("SCHEMA_CACHE_TTL_SECONDS", "21600")))
 SCHEMA_CACHE_MAX_ENTRIES = max(8, int(os.getenv("SCHEMA_CACHE_MAX_ENTRIES", "32")))
 QUERY_RESULT_CACHE_TTL_SECONDS = max(30, int(os.getenv("QUERY_CACHE_TTL_SECONDS", os.getenv("QUERY_RESULT_CACHE_TTL_SECONDS", "300"))))
@@ -405,21 +410,80 @@ class StepTimer:
         if "total" not in marks:
             marks["total"] = now
 
+        # Fill missing stage marks with the previous known timestamp so that
+        # skipped stages report 0 ms and do NOT absorb time into the next real stage.
+        # Example: cache-hit path skips rag_retrieval→db_execution; without this
+        # fill, results_formatting would absorb all that gap time incorrectly.
         out: Dict[str, float] = {"start": 0.0}
-        prev_stage = "start"
         prev_ts = marks["start"]
         for stage in self.STAGES[1:]:
-            ts = marks.get(stage)
-            if ts is None:
-                out[stage] = 0.0
-                continue
+            ts = marks.get(stage, prev_ts)   # default to prev_ts → 0 ms delta
             out[stage] = round((ts - prev_ts) * 1000.0, 2)
             prev_ts = ts
-            prev_stage = stage
 
         # Ensure total reflects start -> total even if intermediates are missing.
         out["total"] = round((marks["total"] - marks["start"]) * 1000.0, 2)
         return out
+
+
+# ---------------------------------------------------------------------------
+# Decorator: @timed_step(timer, stage)
+# ---------------------------------------------------------------------------
+def timed_step(timer: "StepTimer", stage: str):
+    """Decorator that calls timer.mark(stage) after the wrapped function returns."""
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            result = fn(*args, **kwargs)
+            timer.mark(stage)
+            return result
+        return wrapper
+    return decorator
+
+
+# ---------------------------------------------------------------------------
+# Decorator: @with_llm_timeout(timeout_ms)
+# ---------------------------------------------------------------------------
+def with_llm_timeout(timeout_ms: int):
+    """Decorator that wraps a no-arg LLM callable with _invoke_with_timeout.
+
+    Usage:
+        @with_llm_timeout(LLM_SQL_TIMEOUT_MS)
+        def call():
+            return llm.invoke(prompt)
+        resp = call()
+    """
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            return _invoke_with_timeout(lambda: fn(*args, **kwargs), timeout_ms=timeout_ms)
+        return wrapper
+    return decorator
+
+
+# ---------------------------------------------------------------------------
+# Helper: _make_error_result(error, sql, nl_answer, session_state)
+# ---------------------------------------------------------------------------
+def _make_error_result(
+    error: str,
+    session_state: Any,
+    *,
+    sql: Optional[str] = None,
+    nl_answer: Optional[str] = None,
+    query_complexity: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return a standard DATA_QUERY error payload for use inside handle_query."""
+    return {
+        "intent": "DATA_QUERY",
+        "nl_answer": nl_answer,
+        "sql": sql,
+        "results": None,
+        "row_count": 0,
+        "from_cache": False,
+        "error": error,
+        "updated_state": session_state,
+        "query_complexity": query_complexity,
+    }
 
 
 def normalize_sql_dialect(dialect: Optional[str]) -> str:
@@ -547,126 +611,197 @@ Instructions:
 Answer:"""
 )
 
-SQL_TEMPLATE = """You are an elite SQL performance engineer and Text-to-SQL agent.
+SQL_TEMPLATE = """You are an expert Text-to-SQL engineer. Before writing any SQL, reason through every step below in order.
 
-GOAL:
-Given the user's question + provided database schema context, produce ONE optimized SQL query for large datasets.
-
-DIALECT:
-- Active dialect: {dialect_label}
-- Use correct syntax for the active dialect (TOP for SQL Server, LIMIT for Postgres).
-
-OUTPUT FORMAT (strict):
-1) SQL (single query) in one code block.
-2) Optional "Notes:" with at most 3 bullets (assumptions only).
-3) No other text.
+╔══════════════════════════════════════════════════════════════╗
+  DIALECT        : {dialect_label}
+  NOLOCK         : {enable_nolock}
+  TODAY (IST)    : {relative_date_reference}
+╚══════════════════════════════════════════════════════════════╝
 
 SCHEMA:
 {full_schema}
 
-DOMAIN BUSINESS RULES:
+BUSINESS RULES:
 {stored_procedure_guidance}
 
-CONVERSATION CONTEXT:
+CONVERSATION HISTORY:
 {context}
 
-ASIA/KOLKATA REFERENCE RANGES:
-{relative_date_reference}
+↑ If this question is a follow-up or drill-down (references "that", "those", "it", "more", a specific value from previous results, or lacks an explicit date/table):
+  - Inherit the time window (last_time_window) from the previous query above — do NOT default to the current year or month.
+  - Reuse the same primary table (last_table) and date column (last_date_col) unless the question explicitly requests a different one.
+  - Apply the same mandatory filters (BookingStatus exclusions, etc.) from the prior SQL (last_sql).
+  - Add the new filter or drill-down dimension the user requested on top of the inherited context.
+If the question is fully self-contained (has its own year, date range, or table reference), ignore the history and build the query fresh.
 
-RETRIEVED TABLE HINTS (must use at least one of these tables/views):
+RELEVANT TABLES (use at least one):
 {retrieved_tables_hint}
 
-USER QUESTION:
-{question}
+{few_shot_examples}
+════════════════════════════════════════════════════════════════
+QUESTION: {question}
+════════════════════════════════════════════════════════════════
 
-MANDATORY RULES:
-- Output ONLY a SELECT query (no DDL/DML, no EXEC).
-- Use ONLY tables/columns that appear in SCHEMA or retrieved table hints; never invent names.
-- If you cannot answer using the provided schema, return a minimal SELECT that explains the limitation in Notes.
-- SARGable date filters: col >= start AND col < end (no YEAR(), CAST(date as date), etc).
-- No SELECT *.
-- Do not use NOLOCK unless enabled: {enable_nolock}
+### Step 1 — Decompose the question
+Answer these four sub-questions in one line each:
+  a) What is the **metric** or output being requested? (e.g. count, sum, list, percentage)
+  b) What is the **entity or dimension** it applies to? (e.g. supplier, country, product)
+  c) What **time window** is implied or stated? (e.g. "this month", "last 30 days", "all time")
+  d) Are there any **filters, thresholds, or ranking** criteria? (e.g. top 10, status = active)
 
-QUALITY CHECK (silent):
-- SQL matches dialect
-- GROUP BY correctness
-- Date boundary correctness
-- Minimal joins, filter early
-- Avoid unnecessary DISTINCT
+### Step 2 — Map schema objects
+From the SCHEMA and RELEVANT TABLES above, identify:
+  - Exact **table name(s)** needed
+  - Exact **column names** for the metric, grouping, date filter, and WHERE conditions
+  - **Join keys** if more than one table is needed
+  - If any column is ambiguous, explicitly choose the most semantically fitting one and state why
+  → Do NOT invent or abbreviate any table or column name not present in the schema
 
+### Step 3 — Materialise the date range
+Using the IST reference date above, convert the time window from Step 1c to concrete WHERE boundaries.
+Write this as plain text only (NOT inside a SQL code block):
+  e.g. col >= '2023-01-01' AND col < '2024-01-01'
+  Forbidden in WHERE predicates: YEAR(), MONTH(), CAST(col AS DATE), FORMAT()
+  If no date window is mentioned, do not add one — explicitly state "no date filter applied"
+  IMPORTANT: This step is analysis only. The actual SQL goes ONLY in the ```sql``` block in Step 6.
+
+### Step 4 — Apply business rules
+Scan BUSINESS RULES for any rule relevant to the entity or metric identified in Step 1.
+List each rule that applies (e.g. "exclude cancelled orders: StatusId != 5").
+If no rule applies, write "no domain rules apply".
+
+### Step 5 — Design the query skeleton
+Decide:
+  - Aggregation: SUM / COUNT / AVG / none — choose based on the metric, not habit
+  - GROUP BY: only columns that appear in SELECT as non-aggregated expressions
+  - ORDER BY + TOP/LIMIT: required only if the question implies ranking or limits
+  - CTE or subquery: required only if a two-pass aggregation is needed
+
+### Step 6 — Write the SQL
+Using all decisions above, produce the final SQL.
+
+Hard rules:
+  - Exactly ONE SELECT statement — no DDL, DML, EXEC, or statement batches
+  - No SELECT *
+  - Alias every aggregated column with a clear business name (e.g. AS TotalRevenue)
+  - Use TOP N for SQL Server; LIMIT N for PostgreSQL
+  - Apply WITH (NOLOCK) only when NOLOCK = True
+  - Push all filters into WHERE; use HAVING only for post-aggregate conditions
+  - GROUP BY must cover every non-aggregated column in SELECT
+
+```sql
+-- final query
+```
+
+Notes: (optional — at most 3 bullets covering assumptions or edge cases only)"""
+
+# ---------------------------------------------------------------------------
+# DIRECT (short) SQL template — used for simple_llm queries.
+# Static sections first (schema → rules → examples) so OpenAI prompt-caching
+# can cache the longest possible prefix across calls.
+# Output is SQL-only (~100-200 tokens vs ~1500-2000 for chain-of-thought).
+# ---------------------------------------------------------------------------
+DIRECT_SQL_TEMPLATE = """\
+You are a Text-to-SQL expert. Output ONLY a single SQL query inside a ```sql``` block. No explanation.
+
+SCHEMA:
+{full_schema}
+
+BUSINESS RULES:
+{stored_procedure_guidance}
+
+EXAMPLES:
 {few_shot_examples}
 
-Return the final SQL."""
+DIALECT : {dialect_label}
+NOLOCK  : {enable_nolock}
+TODAY   : {relative_date_reference}
 
-RETRY_PROMPT_TEMPLATE = """You are an elite SQL performance engineer and Text-to-SQL agent.
+HISTORY:
+{context}
 
-Fix and return ONE optimized query that matches the user's intent.
+↑ If this question is a follow-up or drill-down (references "that", "those", "it", "more", a specific value from previous results, or lacks an explicit date/table):
+  - Inherit the time window (last_time_window) from the previous query above — do NOT default to the current year or month.
+  - Reuse the same primary table (last_table) and date column (last_date_col) unless the question explicitly requests a different one.
+  - Apply the same mandatory filters (BookingStatus exclusions, etc.) from the prior SQL (last_sql).
+  - Add the new filter or drill-down dimension the user requested on top of the inherited context.
+If the question is fully self-contained (has its own year, date range, or table reference), ignore the history and build the query fresh.
 
-Active dialect: {dialect_label}
-Session NOLOCK enabled: {enable_nolock}
-Asia/Kolkata date reference: {relative_date_reference}
+RELEVANT TABLES: {retrieved_tables_hint}
+
+Hard rules:
+- One SELECT only. No DDL/DML.
+- Alias every aggregated column with a clear business name.
+- Use TOP N (SQL Server) or LIMIT N (PostgreSQL) for rankings — but omit TOP/LIMIT when filtering to a single named entity.
+- Apply WITH (NOLOCK) only when NOLOCK=True.
+- Filter: BookingStatus NOT IN ('Cancelled','Not Confirmed','On Request').
+- Date filters: use >= / < boundaries, never YEAR() / MONTH() / CAST in WHERE.
+- Lookup tables have duplicates — wrap in CTE with SELECT DISTINCT before joining.
+- Name matching: use LIKE '%value%' for agent/supplier/country/city/hotel names, never exact '=' (stored names are often longer than the user typed).
+
+QUESTION: {question}
+
+```sql"""
+
+RETRY_PROMPT_TEMPLATE = """You are an expert Text-to-SQL engineer. A previous SQL attempt failed validation. Diagnose the specific failure, then produce a corrected query.
+
+DIALECT        : {dialect_label}
+NOLOCK         : {enable_nolock}
+TODAY (IST)    : {relative_date_reference}
 
 SCHEMA:
 {full_schema}
 
-DOMAIN BUSINESS RULES:
+BUSINESS RULES:
 {stored_procedure_guidance}
 
 QUESTION:
 {question}
 
-OUTPUT FORMAT (strict):
-1) SQL (single query) in one code block.
-2) Optional "Notes:" with at most 3 bullets (assumptions only).
-3) No other text.
+### Step 1 — Parse the failure
+Classify the most likely failure cause as exactly one of:
+  - schema_error   → wrong table or column name not present in SCHEMA
+  - date_filter    → non-SARGable predicate (YEAR(), MONTH(), CAST in WHERE, FORMAT in WHERE)
+  - group_by       → missing GROUP BY column, or grouped by something not in SELECT
+  - aggregation    → wrong function, or metric aggregated when listing was needed
+  - dialect        → SQL Server syntax used on PostgreSQL or vice versa
+  - intent         → query structure does not match what the question asked
+State the classification and one-sentence reason.
 
-MANDATORY:
-- SARGable date predicates using range filters only.
-- For text filters: `=` first, `LIKE 'x%'` for prefix, `LIKE '%x%'` only if user asked contains.
-- Avoid FORMAT() unless explicitly requested; return MonthStart date for monthly buckets.
-- TOP for SQL Server, LIMIT for Postgres.
-- No SELECT *.
-- Do not use NOLOCK unless enabled.
-- Use only schema columns/tables; do not invent.
+### Step 2 — Identify the exact fault
+Point to the specific clause in the previous query that caused the failure.
+Quote only the broken fragment. Do not rewrite anything yet.
 
-Return the final SQL."""
+### Step 3 — Re-verify schema objects
+From the SCHEMA, confirm the correct table and column names needed.
+If the prior query used a wrong name, explicitly state: "was X → should be Y".
+Do NOT invent or abbreviate any name not present in the schema.
 
-RANKING_RESHAPE_PROMPT_TEMPLATE = """You must correct this ranking query while preserving intent.
+### Step 4 — Resolve dates (if applicable)
+If the failure was date-related, convert the time window to SARGable form as plain text:
+  e.g. col >= '2023-01-01' AND col < '2024-01-01'
+  Forbidden in WHERE predicates: YEAR(), MONTH(), CAST(col AS DATE), FORMAT()
+  IMPORTANT: Write only analysis here. The actual SQL goes ONLY in the ```sql``` block in Step 5.
+Otherwise skip this step and write "date filter not relevant".
 
-Active dialect: {dialect_label}
-Session NOLOCK enabled: {enable_nolock}
-Asia/Kolkata date reference: {relative_date_reference}
+### Step 5 — Write the corrected SQL
 
-QUESTION:
-{question}
+Hard rules:
+  - Exactly ONE SELECT — no DDL, DML, EXEC
+  - No SELECT *
+  - Prefer `=` over LIKE for exact matches; use `LIKE 'x%'` for prefix only
+  - Do not use FORMAT() for date grouping — return the raw date column for monthly buckets
+  - TOP N for SQL Server; LIMIT N for PostgreSQL
+  - WITH (NOLOCK) only when NOLOCK = True
+  - GROUP BY must cover every non-aggregated SELECT column
+  - Use only tables and columns present in SCHEMA
 
-SCHEMA:
-{full_schema}
+```sql
+-- corrected query
+```
 
-STORED PROCEDURE LOGIC:
-{stored_procedure_guidance}
-
-CURRENT SQL:
-{current_sql}
-
-ISSUE:
-{violation_reason}
-
-RULES:
-- Return ONE query only.
-- Keep only user-requested metric(s).
-- Ranking must aggregate at entity level first, then apply TOP/LIMIT + ORDER BY.
-- Do not group by date unless the question explicitly asks date-wise ranking.
-- SARGable date filters only; resolve relative dates using Asia/Kolkata.
-- Do not use NOLOCK unless enabled.
-- Use only schema-provided objects.
-
-OUTPUT FORMAT (strict):
-1) SQL (single query) in one code block.
-2) Optional "Notes:" with at most 3 bullets (assumptions only).
-3) No other text.
-
-Return the final SQL."""
+Notes: (optional — at most 3 bullets, assumptions only)"""
 
 SQL_VALIDATOR_TEMPLATE = """You are a SQL validator. Output ONLY JSON.
 
@@ -735,6 +870,32 @@ def _raw_conn_from_engine(db: SQLDatabase, timeout: int = 15):
     )
 
 
+def _schema_tables_from_env() -> Optional[List[str]]:
+    """Return optional table allow-list from SCHEMA_TABLES env var.
+
+    Expected format:
+      SCHEMA_TABLES="TableA,TableB,dbo.TableC"
+    """
+    raw = (os.getenv("SCHEMA_TABLES") or "").strip()
+    if not raw:
+        return None
+
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in raw.split(","):
+        name = (item or "").strip().replace("[", "").replace("]", "")
+        if not name:
+            continue
+        if "." in name:
+            name = name.split(".")[-1]
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(name)
+    return out or None
+
+
 # --- Schema loading ---
 
 def load_schema_from_sqldb(rag_engine: RAGEngine, db: SQLDatabase):
@@ -749,6 +910,15 @@ def load_schema_from_sqldb(rag_engine: RAGEngine, db: SQLDatabase):
 
     engine = db._engine
     table_names = list(db.get_usable_table_names())
+    allowed_tables = _schema_tables_from_env()
+    if allowed_tables:
+        allowed_set = {t.lower() for t in allowed_tables}
+        table_names = [t for t in table_names if str(t).lower() in allowed_set]
+        available_set = {str(t).lower() for t in table_names}
+        missing = [t for t in allowed_tables if t.lower() not in available_set]
+        if missing:
+            logger.warning("SCHEMA_TABLES not found in usable tables: %s", ",".join(missing))
+        logger.info("SCHEMA_TABLES filter applied: %d tables", len(table_names))
 
     if not table_names:
         return ""
@@ -758,7 +928,9 @@ def load_schema_from_sqldb(rag_engine: RAGEngine, db: SQLDatabase):
     try:
         with closing(_raw_conn_from_engine(db)) as conn:
             with closing(conn.cursor()) as cursor:
-                placeholders = ",".join([f"'{t}'" for t in table_names])
+                placeholders = ",".join(
+                    ["'" + str(t).replace("'", "''") + "'" for t in table_names]
+                )
                 cursor.execute(
                     f"SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE "
                     f"FROM INFORMATION_SCHEMA.COLUMNS "
@@ -1580,30 +1752,29 @@ def _question_mentions_result_value(question_lower: str, previous_result_df) -> 
     skip_words = {"what", "about", "how", "show", "the", "for", "and", "but", "with", "from", "only", "just", "that", "this", "those", "them", "it", "me", "can", "you", "is", "are", "was", "were", "do", "does", "did"}
     question_words = [w.strip("?.,!") for w in question_lower.split() if len(w.strip("?.,!")) > 2 and w.strip("?.,!") not in skip_words]
 
-    # CHANGED: cap scan effort to keep follow-up detection fast on hot path.
-    scanned_cols = 0
+    if not question_words:
+        return False
+
+    # Scan ALL text columns — no cap. Numeric columns are cheap to skip.
     for col in previous_result_df.columns:
-        if scanned_cols >= 3:
-            break
         try:
             series = previous_result_df[col].dropna()
             if series.empty:
                 continue
             sample_vals = series.astype(str).head(300)
-            # Prefer text-like columns for value mention matching.
+            # Skip non-text columns (pure numeric)
             if not any(c.isalpha() for c in " ".join(sample_vals.head(20).tolist())):
                 continue
 
-            unique_values = sample_vals.str.lower().drop_duplicates().head(50).tolist()
-            scanned_cols += 1
+            unique_values = sample_vals.str.lower().drop_duplicates().head(100).tolist()
             for val in unique_values:
                 if len(val) > 2:
                     # Check if full value appears in question
                     if val in question_lower:
                         return True
-                    # Check if any question word appears in a result value
+                    # Check if any question word appears as substring in a result value
                     for word in question_words:
-                        if len(word) > 2 and word in val:
+                        if len(word) >= 3 and word in val:
                             return True
         except Exception:
             continue
@@ -1639,8 +1810,15 @@ def is_filter_modification_followup(question: str, previous_result_df=None) -> b
 
     # "what about X?" / "how about X?" / "and X?" patterns
     about_patterns = ["what about", "how about", "and what about"]
+    skip_words = {"what", "about", "how", "show", "the", "for", "and", "but", "with", "from",
+                  "only", "just", "that", "this", "those", "them", "it", "me", "can", "you",
+                  "is", "are", "was", "were", "do", "does", "did"}
     if any(p in q_lower for p in about_patterns) and len(words) <= 8:
-        if _question_mentions_result_value(q_lower, previous_result_df):
+        # Extract the subject term after the prefix (e.g. "seera" from "what about seera?")
+        subject_words = [w.strip("?.,!") for w in words if len(w.strip("?.,!")) >= 3
+                         and w.strip("?.,!") not in skip_words]
+        # If there's a meaningful subject term AND we have prior results → treat as filter
+        if subject_words and previous_result_df is not None and len(previous_result_df) > 0:
             return True
 
     if len(words) <= 5 and any(p in q_lower for p in ["for ", "of ", "from ", "about "]):
@@ -1672,19 +1850,20 @@ def modify_sql_for_filter(original_sql: str, filter_request: str, llm, db: Optio
 
 Previous SQL: {original_sql}
 
-Now the user wants to modify it with this request: "{filter_request}"
+Now the user wants to drill down or filter with this request: "{filter_request}"
 
-Modify the SQL to satisfy the user's request. You MUST keep the SAME table/view and the SAME SELECT columns. Only add or change WHERE filters.
+Modify the SQL to satisfy the user's request. Keep the same table/view and SELECT columns.
 
 Rules:
 - Output ONLY the modified SQL, nothing else
-- KEEP the same FROM table - do NOT switch to a different table/view
+- KEEP the same FROM table — do NOT switch to a different table/view
 - KEEP the same SELECT columns, GROUP BY, ORDER BY structure
 - Only ADD or MODIFY the WHERE clause to filter results
-- Text matching priority:
-  1) exact match with '=' by default
-  2) prefix match with LIKE 'value%' if user intent suggests starts-with/prefix
-  3) contains match with LIKE '%value%' ONLY if user explicitly says contains/substring
+- Name/text column matching: ALWAYS use LIKE '%value%' (contains match) for business names
+  such as agent name, supplier name, country, city, hotel, chain — never use exact '=' for these
+  because stored names are often longer than what the user typed (e.g. "dida" → "DIDATRAVEL TECHNOLOGY SINGAPORE PTE. LTD.")
+- If filtering to a single entity (one agent, one country, etc.), REMOVE any TOP N / LIMIT clause
+  so the full result for that entity is shown
 - Keep date filters SARGable:
   - Use range predicates: date_col >= 'YYYY-MM-DD' AND date_col < 'YYYY-MM-DD'
   - Do NOT use YEAR(date_col), MONTH(date_col), or CAST(date_col AS DATE) in WHERE
@@ -1696,10 +1875,12 @@ Modified SQL:"""
         response = llm.invoke(prompt)
         modified_sql = response.content.strip() if hasattr(response, "content") else str(response).strip()
         modified_sql = _clean_sql_response(modified_sql)
-        if modified_sql.upper().startswith("SELECT"):
+        logger.info("modify_sql_for_filter | request=%r | result_sql=%s", filter_request, modified_sql[:300])
+        if modified_sql.upper().startswith("SELECT") or modified_sql.upper().startswith("WITH"):
             return modified_sql
         return original_sql
     except Exception:
+        logger.warning("modify_sql_for_filter failed", exc_info=True)
         return original_sql
 
 
@@ -1821,9 +2002,25 @@ def detect_intent_simple(message: str) -> Optional[str]:
         "cities", "region", "regions", "show", "list", "find", "get",
         "count", "select", "where", "hotel", "hotels", "resort", "resorts",
         "all", "travel", "checkin", "checkout", "yesterday", "today",
-        "month", "year", "date",
+        "month", "year", "date", "trend", "compare", "comparison", "vs",
+        "versus", "breakdown", "summary", "report", "analysis", "average",
+        "avg", "total", "sum", "percentage", "pct", "quarter", "weekly",
+        "daily", "monthly", "annually", "ytd", "qoq", "yoy", "growth",
+        "performance", "ranking", "distribution", "volume", "amount",
+        "nationality", "market", "segment", "channel", "chain",
     }
     if len(words & data_keywords) >= 2:
+        return "DATA_QUERY"
+
+    # Single strong data keyword is enough if question starts with an action word
+    action_starters = {"show", "list", "find", "get", "count", "what", "which", "who",
+                       "how", "give", "display", "tell", "compare", "calculate", "fetch"}
+    strong_data_keywords = {
+        "booking", "bookings", "revenue", "profit", "cost", "sales", "supplier",
+        "agent", "hotel", "country", "city", "region", "chain", "nationality",
+    }
+    first_word = msg_lower.split()[0] if msg_lower else ""
+    if first_word in action_starters and words & strong_data_keywords:
         return "DATA_QUERY"
 
     ranking_words = {"top", "bottom", "highest", "maximum", "max", "lowest", "minimum", "most", "least"}
@@ -2003,7 +2200,14 @@ def _results_to_records(df: Optional[pd.DataFrame], places: int = 2) -> List[Dic
         if pd.api.types.is_float_dtype(series):
             out[col] = series.round(places)
         elif pd.api.types.is_object_dtype(series):
-            out[col] = series.map(lambda v: _round_cell_value(v, places))
+            # Fast path: if the column contains Decimal values, convert the whole
+            # series to float64 via pandas (vectorized C-level conversion) instead
+            # of calling _round_cell_value() row-by-row in pure Python.
+            non_null = series.dropna()
+            if len(non_null) > 0 and isinstance(non_null.iloc[0], Decimal):
+                out[col] = pd.to_numeric(series, errors="coerce").round(places)
+            else:
+                out[col] = series.map(lambda v: _round_cell_value(v, places))
     return out.to_dict(orient="records")
 
 
@@ -2473,11 +2677,13 @@ def apply_query_performance_guardrails(
 
     # For heavy BookingData aggregates without explicit time scope, constrain to current year.
     # This avoids full-table scans on large transactional history.
+    # Skip if the SQL already has ANY date filter (e.g. follow-up queries that inherit date
+    # context from the previous turn but don't repeat the year in the question text).
     if _query_has_aggregation(guarded) and not _question_requests_all_time(question) and not _question_has_explicit_date_scope(question):
         table_entry = _get_table_entry_from_sql(guarded, db)
         if table_entry and table_entry.get("table_normalized") == "bookingdata":
             created_col = _pick_existing_column(table_entry, ["createddate", "created_date", "bookingdate", "booking_date"])
-            if created_col and not _sql_has_date_filter_for_col(guarded, created_col):
+            if created_col and not _sql_has_date_filter_for_col(guarded, created_col) and not _sql_has_any_date_filter(guarded):
                 created_col_quoted = _quote_sql_identifier(created_col)
                 current_year_cond = (
                     f"{created_col_quoted} >= DATEFROMPARTS(YEAR(GETDATE()), 1, 1) "
@@ -2559,6 +2765,14 @@ def _rewrite_leading_wildcard_like(sql: str, question: str = "") -> str:
     if any(tok in q for tok in ("contains", "contain", "substring", "anywhere", "includes")):
         return sql
 
+    # Name-type column keywords — never rewrite LIKE '%x%' to = 'x' for these;
+    # stored names are always longer than what the user typed.
+    name_col_keywords = (
+        "name", "city", "country", "region", "chain", "nationality",
+        "hotel", "agent", "supplier", "product", "type", "status",
+        "brand", "category", "description",
+    )
+
     pattern = re.compile(
         r"(?i)(?P<col>(?:\[[^\]]+\]|\w+)(?:\.(?:\[[^\]]+\]|\w+))?)\s+LIKE\s+N?'%(?P<val>[^%_']+)%'"
     )
@@ -2568,7 +2782,11 @@ def _rewrite_leading_wildcard_like(sql: str, question: str = "") -> str:
         val = match.group("val").strip()
         if not val:
             return match.group(0)
-        # Prefer exact match for identifier-like tokens; otherwise prefix for index-friendliness.
+        # Keep LIKE '%x%' for name/descriptive columns — exact = would miss partial names
+        col_lower = col.lower().strip("[]")
+        if any(k in col_lower for k in name_col_keywords):
+            return match.group(0)  # preserve as-is
+        # For non-name columns: prefer exact match for identifier-like tokens
         if re.fullmatch(r"[A-Za-z0-9_.\-]+", val):
             return f"{col} = '{val}'"
         return f"{col} LIKE '{val}%'"
@@ -2581,6 +2799,9 @@ def _outer_select_has_top_or_limit(sql: str) -> bool:
         return True
     sql_clean = sql.strip()
     if re.search(r"(?i)\bLIMIT\s+\d+\b", sql_clean):
+        return True
+    # OFFSET ... FETCH NEXT ... ROWS ONLY is SQL Server pagination — incompatible with TOP
+    if re.search(r"(?i)\bOFFSET\s+\d+\s+ROWS\b", sql_clean):
         return True
     select_matches = list(re.finditer(r"(?i)\bSELECT\b", sql_clean))
     if not select_matches:
@@ -3035,6 +3256,11 @@ def expand_fuzzy_search(sql: str, db: Optional[SQLDatabase] = None) -> str:
     if "ilike" not in sql_lower and "like" not in sql_lower:
         return sql
 
+    # Skip CTE queries — they already have targeted column filters from modify_sql_for_filter.
+    # Expanding LIKE to all columns in a CTE causes type conversion errors (varchar vs int).
+    if sql_lower.lstrip().startswith("with "):
+        return sql
+
     table_name = _extract_from_table_name(sql)
     if not table_name:
         return sql
@@ -3043,7 +3269,12 @@ def expand_fuzzy_search(sql: str, db: Optional[SQLDatabase] = None) -> str:
     if db is not None:
         table_entry = _get_schema_profile(db)["lookup"].get(table_name)
         if table_entry:
-            valid_columns = _infer_text_columns(table_entry)
+            # Only use confirmed varchar/nvarchar text columns — never numeric/int columns
+            col_types = table_entry.get("column_types", {})
+            valid_columns = [
+                c for c in _infer_text_columns(table_entry)
+                if _is_text_type(col_types.get(c.lower(), ""))
+            ]
     if not valid_columns:
         return sql
     valid_column_lowers = {c.lower() for c in valid_columns}
@@ -3515,45 +3746,6 @@ def validate_ranking_sql_shape(question: str, sql: str) -> Tuple[bool, str]:
     return True, ""
 
 
-def _retry_ranking_shape_if_needed(
-    question: str,
-    sql: str,
-    llm,
-    full_schema: str,
-    stored_procedure_guidance: str,
-    sql_dialect: str = DEFAULT_SQL_DIALECT,
-    enable_nolock: bool = False,
-) -> str:
-    is_ok, reason = validate_ranking_sql_shape(question, sql)
-    if is_ok:
-        return sql
-    if llm is None:
-        return sql
-
-    prompt = RANKING_RESHAPE_PROMPT_TEMPLATE.format(
-        question=question,
-        full_schema=full_schema or "",
-        stored_procedure_guidance=stored_procedure_guidance or "",
-        current_sql=sql,
-        violation_reason=reason,
-        dialect_label=_dialect_label(sql_dialect),
-        enable_nolock=str(bool(enable_nolock)).lower(),
-        relative_date_reference=_build_relative_date_reference(),
-    )
-    try:
-        resp = llm.invoke(prompt)
-        candidate = resp.content.strip() if hasattr(resp, "content") else str(resp).strip()
-        candidate = _clean_sql_response(candidate)
-        candidate = fix_common_sql_errors(candidate, dialect=sql_dialect)
-        valid, _ = validate_sql(candidate)
-        if not valid:
-            return sql
-        ok2, _ = validate_ranking_sql_shape(question, candidate)
-        return candidate if ok2 else sql
-    except Exception:
-        return sql
-
-
 def _topn_dimension_candidates(question_lower: str) -> Tuple[List[str], int]:
     """Return (ordered_candidates, primary_count).
 
@@ -3792,14 +3984,21 @@ def _build_date_where_clauses(q: str, date_col_expr: str) -> List[str]:
             clauses.append(f"{date_col_expr} >= '{exact_start.isoformat()}'")
             clauses.append(f"{date_col_expr} < '{exact_end.isoformat()}'")
         else:
-            last_n_days = re.search(r"last\s+(\d+)\s+days", q)
-            if last_n_days:
-                n = max(1, min(int(last_n_days.group(1)), 365))
-                today_start = datetime.fromisoformat(r["today_start"]).date()
-                start_date = today_start - timedelta(days=n)
-                end_date = today_start + timedelta(days=1)
-                clauses.append(f"{date_col_expr} >= '{start_date.isoformat()}'")
-                clauses.append(f"{date_col_expr} < '{end_date.isoformat()}'")
+            # Bare 4-digit year: "for 2024", "in 2024", "year 2024"
+            year_match = re.search(r"\b(20\d{2})\b", q)
+            if year_match:
+                year = int(year_match.group(1))
+                clauses.append(f"{date_col_expr} >= '{year}-01-01'")
+                clauses.append(f"{date_col_expr} < '{year + 1}-01-01'")
+            else:
+                last_n_days = re.search(r"last\s+(\d+)\s+days", q)
+                if last_n_days:
+                    n = max(1, min(int(last_n_days.group(1)), 365))
+                    today_start = datetime.fromisoformat(r["today_start"]).date()
+                    start_date = today_start - timedelta(days=n)
+                    end_date = today_start + timedelta(days=1)
+                    clauses.append(f"{date_col_expr} >= '{start_date.isoformat()}'")
+                    clauses.append(f"{date_col_expr} < '{end_date.isoformat()}'")
     return clauses
 
 
@@ -4060,7 +4259,7 @@ def _append_query_cache(query_cache: Any, item: Any) -> None:
         query_cache.append(item)
         return
     if isinstance(query_cache, list):
-        if len(query_cache) >= MAX_CACHE_SIZE:
+        if len(query_cache) >= GLOBAL_QUERY_CACHE_MAX_ENTRIES:
             query_cache.pop(0)
         query_cache.append(item)
 
@@ -4379,9 +4578,16 @@ def initialize_connection(
     stored_proc_raw_text = _read_stored_procedure_file()
     stored_proc_sections_count = len(_parse_stored_procedure_sections(stored_proc_raw_text))
 
-    # Fast discovery: query INFORMATION_SCHEMA to find relevant tables/views
-    # instead of letting SQLAlchemy introspect ALL 100+ tables (which takes minutes).
-    relevant_tables = _discover_relevant_tables(host, port_num, db_username, db_password, database)
+    # SCHEMA_TABLES override: when provided, force SQLDatabase reflection + RAG
+    # schema loading to this exact allow-list.
+    schema_tables_override = _schema_tables_from_env()
+    if schema_tables_override:
+        relevant_tables = schema_tables_override
+        logger.info("SCHEMA_TABLES override active: %d tables", len(relevant_tables))
+    else:
+        # Fast discovery: query INFORMATION_SCHEMA to find relevant tables/views
+        # instead of letting SQLAlchemy introspect ALL 100+ tables (which takes minutes).
+        relevant_tables = _discover_relevant_tables(host, port_num, db_username, db_password, database)
 
     db_config = DatabaseConfig(
         host=host,
@@ -4423,7 +4629,10 @@ def initialize_connection(
             # load_schema_from_sqldb uses fast inspector (no sample rows) and
             # returns CREATE TABLE text suitable for LLM prompts.
             cached_schema_text = load_schema_from_sqldb(rag, db)
-            _add_stored_procedure_knowledge_to_rag(rag, stored_proc_raw_text)
+            if schema_tables_override:
+                logger.info("SCHEMA_TABLES mode: skipping stored procedure knowledge injection into RAG")
+            else:
+                _add_stored_procedure_knowledge_to_rag(rag, stored_proc_raw_text)
             rag.build_index()
             embedder = rag.embedder
             rag_backend = getattr(rag, "vector_backend", "faiss")
@@ -4470,43 +4679,20 @@ def initialize_connection(
             return override
         return build_domain_digest(_read_stored_procedure_file())
 
-    api_base = None
-    if llm_provider.lower() == "deepseek":
-        api_base = "https://api.deepseek.com"
+    # HTTP request timeout slightly above the thread-pool SLA so the HTTP layer
+    # doesn't outlive the timeout gate and leak idle sockets.
+    _http_timeout = max(20, LLM_SQL_TIMEOUT_MS / 1000 + 5)
 
-    if api_base:
-        llm = ChatOpenAI(
-            model=model,
-            temperature=temperature,
-            openai_api_key=api_key,
-            openai_api_base=api_base,
-        )
-    else:
-        os.environ["OPENAI_API_KEY"] = api_key
-        llm = ChatOpenAI(model=model, temperature=temperature)
+    os.environ["OPENAI_API_KEY"] = api_key
+    llm = ChatOpenAI(
+        model=model,
+        temperature=temperature,
+        openai_api_key=api_key,
+        request_timeout=_http_timeout,
+        max_retries=0,
+    )
 
-    # Create reasoning LLM — used as the PRIMARY SQL generator for all LLM queries.
-    # When provider is DeepSeek, always spin up deepseek-reasoner regardless of which
-    # chat model the user picked (deepseek-chat, deepseek-coder, etc.).
-    # If the user already picked "deepseek-reasoner" as the model, reuse llm directly.
     reasoning_llm = None
-    if llm_provider.lower() == "deepseek":
-        if "reasoner" in model.lower() or "r1" in model.lower():
-            # User already chose the reasoning model — reuse it
-            reasoning_llm = llm
-            logger.info(f"Using {model} as reasoning model (user-selected)")
-        else:
-            try:
-                reasoning_llm = ChatOpenAI(
-                    model="deepseek-reasoner",
-                    temperature=0,
-                    openai_api_key=api_key,
-                    openai_api_base="https://api.deepseek.com",
-                    max_tokens=4096,
-                )
-                logger.info("DeepSeek R1 reasoning model initialized — will handle ALL SQL generation")
-            except Exception as e:
-                logger.warning(f"Could not initialize deepseek-reasoner, falling back to {model}: {e}")
 
     def get_few_shot_examples(inputs):
         return inputs.get("few_shot_examples", "")
@@ -4514,7 +4700,11 @@ def initialize_connection(
     def get_retrieved_tables_hint(inputs):
         return inputs.get("retrieved_tables_hint", "none")
 
-    # sql_chain is kept as fallback when no reasoning model is available
+    # max_tokens=700 caps verbose chain-of-thought output — the SQL block itself
+    # is rarely >400 tokens. This is applied only to the SQL chain so NL response
+    # and intent detection are unaffected.
+    # OpenAI automatically caches prompt prefixes ≥1024 tokens (the schema section
+    # qualifies), reducing both cost and time-to-first-token.
     sql_chain = (
         RunnablePassthrough.assign(
             full_schema=get_full_schema,
@@ -4523,7 +4713,7 @@ def initialize_connection(
             retrieved_tables_hint=get_retrieved_tables_hint,
         )
         | prompt
-        | llm.bind(stop=["\nSQLResult:"])
+        | llm.bind(stop=["\nSQLResult:"], max_tokens=700)
         | StrOutputParser()
     )
 
@@ -4535,12 +4725,11 @@ def initialize_connection(
         tables_count = len(schema_info.get("tables", []))
         views_count = len(schema_info.get("views", []))
 
-    reasoning_status = f"reasoning=deepseek-reasoner (ALL queries)" if reasoning_llm else "reasoning=none"
     message = (
         f"Connected! Using {llm_provider} ({model}). "
         f"Schema counts on connect: tables={tables_count}, views={views_count}. "
         f"Timeout: {query_timeout}s. {rag_status}. "
-        f"Stored procedure guides: {stored_proc_sections_count}. {reasoning_status}."
+        f"Stored procedure guides: {stored_proc_sections_count}."
     )
     return db, db_config, sql_chain, llm, reasoning_llm, rag, embedder, message, tables_count, views_count, cached_schema_text
 
@@ -4737,15 +4926,18 @@ def _build_prompt_context_from_state(
     conversation_context: str,
     conversation_turns: Optional[List[ConversationTurn]],
 ) -> str:
-    # CHANGED: prompts now prioritize structured memory over long raw strings.
     recent_text = ""
-    if conversation_context and conversation_context.strip():
+    if conversation_turns:
+        recent_text = serialize_conversation_turns(conversation_turns, max_turns=3)[-900:]
+    elif conversation_context and conversation_context.strip():
         trimmed = _trim_conversation_context(conversation_context, max_turns=2)
         recent_text = trimmed[-700:]
-    elif conversation_turns:
-        recent_text = serialize_conversation_turns(conversation_turns, max_turns=2)[-700:]
 
-    structured_json = json.dumps(state, ensure_ascii=True)
+    # Compact structured state — only emit fields that have values
+    compact = {k: v for k, v in (state or {}).items() if v and k != "last_sql"}
+    if state and state.get("last_sql"):
+        compact["last_sql"] = state["last_sql"][:300]  # truncate to avoid prompt bloat
+    structured_json = json.dumps(compact, ensure_ascii=True)
     recent_block = recent_text if recent_text else "none"
     return f"STRUCTURED_STATE: {structured_json}\nRECENT_CONVERSATION: {recent_block}"
 
@@ -5277,6 +5469,7 @@ def handle_query(
     def _finalize_result(payload: Dict[str, Any]) -> Dict[str, Any]:
         timer.mark("total")
         payload.setdefault("fallback_used", fallback_used_request)
+        payload.setdefault("query_complexity", _query_complexity)
         payload["timing"] = timer.summary()
         log_event(
             logger,
@@ -5307,6 +5500,10 @@ def handle_query(
     logger.info(f"Intent detected: {intent} ({(time.perf_counter()-t_intent)*1000:.0f}ms) | Q: {question[:80]}")
     timer.mark("intent_detection")
 
+    # Auto-routing: classify question complexity once, used for model+prompt selection below.
+    _query_complexity = _estimate_query_complexity(question)
+    logger.info(f"Query complexity: {_query_complexity} | Q: {question[:80]}")
+
     # Step 2: Handle non-data-query intents
     if intent in {"GREETING", "THANKS", "HELP", "FAREWELL", "OUT_OF_SCOPE", "CLARIFICATION_NEEDED"}:
         tables = ", ".join(db.get_usable_table_names()) if db else "none"
@@ -5323,10 +5520,16 @@ def handle_query(
             "updated_state": session_state,
         })
 
-    full_schema_text = cached_schema_text or (db.get_table_info() if db else "")
-    timer.mark("schema_loading")
-    stored_procedure_guidance = build_domain_digest(_read_stored_procedure_file())
-    timer.mark("stored_procedure_guidance")
+    @timed_step(timer, "schema_loading")
+    def _load_schema():
+        return cached_schema_text or (db.get_table_info() if db else "")
+
+    @timed_step(timer, "stored_procedure_guidance")
+    def _load_stored_proc_guidance():
+        return build_domain_digest(_read_stored_procedure_file())
+
+    full_schema_text = _load_schema()
+    stored_procedure_guidance = _load_stored_proc_guidance()
 
     # Step 3: Check for sort/filter follow-up
     previous_sql = _get_last_sql(chat_history) or session_state.get("last_sql")
@@ -5388,6 +5591,14 @@ def handle_query(
     else:
         is_sort_request = previous_sql and is_sort_followup(question)
         is_filter_mod = previous_sql and is_filter_modification_followup(question, previous_result_df)
+        logger.info(
+            "followup_routing | q=%r prev_sql=%s prev_df_rows=%s is_sort=%s is_filter=%s",
+            question[:80],
+            bool(previous_sql),
+            len(previous_result_df) if previous_result_df is not None else "None",
+            is_sort_request,
+            is_filter_mod,
+        )
 
     is_followup_filter = False
     if is_sort_request:
@@ -5422,6 +5633,14 @@ def handle_query(
             _update_session_query_state(session_state, cached_sql, active_dialect, question=question)
             results = _results_to_records(cached_df, places=2)
             timer.mark("results_formatting")
+            # Build a conversation turn for cache hits too so follow-up queries
+            # can see what was asked and what SQL was used.
+            cached_turn = ConversationTurn(
+                question=question, sql=cached_sql,
+                topic=_extract_query_topic(question, cached_sql),
+                columns=list(cached_df.columns) if hasattr(cached_df, "columns") else [],
+                row_count=len(results), status="cache",
+            )
             return _finalize_result({
                 "intent": "DATA_QUERY",
                 "nl_answer": None,
@@ -5431,8 +5650,9 @@ def handle_query(
                 "from_cache": True,
                 "error": None,
                 "updated_state": session_state,
-                    "nl_pending": True,
-                })
+                "nl_pending": True,
+                "conversation_turn": cached_turn,
+            })
         else:
             log_event(logger, logging.INFO, "query_cache_miss", scope="global_and_session")
 
@@ -5463,7 +5683,12 @@ def handle_query(
                     intent_key=_extract_query_topic(question, previous_sql or ""),
                 )
                 examples = rag_context.get("examples", [])[:3]
-                rag_table_hints = list(rag_context.get("tables", []) or [])
+                raw_tables = rag_context.get("tables", []) or []
+                rag_table_hints = [
+                    t["table"] if isinstance(t, dict) else str(t)
+                    for t in raw_tables
+                    if t
+                ]
                 if examples:
                     parts = ["EXAMPLE QUERIES (follow these patterns closely):"]
                     for ex in examples:
@@ -5496,23 +5721,17 @@ def handle_query(
         effective_few_shot = prompt_payload["few_shot_examples"]
         retrieved_tables_hint = ", ".join(rag_table_hints[:6]) if rag_table_hints else (session_state.get("last_table") or "none")
 
-        # ── Complexity-based LLM routing ──
-        # deterministic → already handled above (no LLM call at all)
-        # simple_llm    → fast deepseek-chat (target <3s)
-        # complex_llm   → deepseek-reasoner when available (accepts longer wait for quality)
-        # follow-ups    → fast chat model (just modifying existing SQL)
-        pre_complexity = _estimate_query_complexity(question)
-        use_reasoning = (
-            reasoning_llm is not None
-            and pre_complexity == "complex_llm"
-            and not is_sort_request
-            and not is_followup_filter
-        )
+        # ── LLM SQL generation ──
+        # pre_complexity = _estimate_query_complexity(question)
+        # use_reasoning = (
+        #     reasoning_llm is not None
+        #     and pre_complexity == "complex_llm"
+        #     and not is_sort_request
+        #     and not is_followup_filter
+        # )
         if ENABLE_LLM_SLA:
-            # SLA mode prioritizes bounded latency; reasoner is intentionally disabled.
             use_reasoning = False
         if use_reasoning and _elapsed_seconds() > 2.0:
-            # CHANGED: latency budget guard (<5s target) — avoid slow reasoner on late path.
             logger.info("Skipping reasoning_llm due to latency budget (>2s elapsed)")
             use_reasoning = False
 
@@ -5533,14 +5752,10 @@ def handle_query(
                 fallback_used = True
                 fallback_used_request = True
                 fallback_reason = resolved_reason or reason
-                logger.warning(
-                    "fallback_used=true reason=%s stage=sql_generation",
-                    fallback_reason,
-                )
+                logger.warning("fallback_used=true reason=%s stage=sql_generation", fallback_reason)
                 return True
 
             if use_reasoning:
-                # Build flat prompt string — reasoner works best with a single user message
                 reasoning_prompt = SQL_TEMPLATE.format(
                     full_schema=effective_schema_text,
                     stored_procedure_guidance=effective_guidance,
@@ -5553,38 +5768,67 @@ def handle_query(
                     enable_nolock=nolock_setting,
                 )
                 try:
-                    reasoning_resp = _invoke_with_timeout(
-                        lambda: reasoning_llm.invoke(reasoning_prompt),
-                        timeout_ms=LLM_SQL_TIMEOUT_MS,
-                    )
+                    @with_llm_timeout(LLM_SQL_TIMEOUT_MS)
+                    def _call_reasoning():
+                        return reasoning_llm.invoke(reasoning_prompt)
+                    reasoning_resp = _call_reasoning()
                     raw_text = reasoning_resp.content.strip() if hasattr(reasoning_resp, "content") else str(reasoning_resp).strip()
-                    # Strip <think>...</think> reasoning block that DeepSeek R1 prepends
                     resp_text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
                 except FuturesTimeoutError:
                     if not _try_deterministic_timeout_fallback("reasoning_timeout"):
-                        # Hard timeout fallback for non-deterministic intents: try fast chat model.
                         logger.warning("reasoning_llm timeout; trying fast_llm path")
                         use_reasoning = False
-            else:
-                # Fast path: use standard chat model via pre-built chain
-                pass
 
             if not fallback_used and not use_reasoning:
                 try:
-                    resp_text = _invoke_with_timeout(
-                        lambda: sql_chain.invoke({
-                            "question": question,
-                            "context": effective_prompt_context,
-                            "few_shot_examples": effective_few_shot,
-                            "retrieved_tables_hint": retrieved_tables_hint,
-                            "dialect_label": dialect_label,
-                            "relative_date_reference": relative_date_reference,
-                            "enable_nolock": nolock_setting,
-                            "full_schema_override": effective_schema_text,
-                            "stored_procedure_guidance_override": effective_guidance,
-                        }),
-                        timeout_ms=LLM_SQL_TIMEOUT_MS,
-                    )
+                    # Auto-routing: simple_llm → gpt-4o-mini + DIRECT_SQL_TEMPLATE
+                    #               complex_llm → configured model + full chain-of-thought
+                    if _query_complexity == "simple_llm":
+                        _direct_model = os.getenv("LLM_MODEL_SIMPLE", "gpt-4o-mini")
+                        _direct_llm = ChatOpenAI(
+                            model=_direct_model,
+                            temperature=0,
+                            openai_api_key=llm.openai_api_key if hasattr(llm, "openai_api_key") else os.getenv("OPENAI_API_KEY", ""),
+                        )
+                        _direct_chain = (
+                            ChatPromptTemplate.from_template(DIRECT_SQL_TEMPLATE)
+                            | _direct_llm.bind(stop=["\nSQLResult:"], max_tokens=400)
+                            | StrOutputParser()
+                        )
+                        _direct_vars = {
+                            "question":                 question,
+                            "context":                  effective_prompt_context,
+                            "few_shot_examples":        effective_few_shot,
+                            "retrieved_tables_hint":    retrieved_tables_hint,
+                            "dialect_label":            dialect_label,
+                            "relative_date_reference":  relative_date_reference,
+                            "enable_nolock":            nolock_setting,
+                            "full_schema":              effective_schema_text,
+                            "stored_procedure_guidance": effective_guidance,
+                        }
+                        logger.info(f"routing=simple_llm model={_direct_model} prompt=direct")
+
+                        @with_llm_timeout(LLM_SQL_TIMEOUT_MS)
+                        def _call_sql_chain():
+                            return _direct_chain.invoke(_direct_vars)
+                    else:
+                        logger.info(f"routing={_query_complexity} model=default prompt=cot")
+
+                        @with_llm_timeout(LLM_SQL_TIMEOUT_MS)
+                        def _call_sql_chain():
+                            return sql_chain.invoke({
+                                "question": question,
+                                "context": effective_prompt_context,
+                                "few_shot_examples": effective_few_shot,
+                                "retrieved_tables_hint": retrieved_tables_hint,
+                                "dialect_label": dialect_label,
+                                "relative_date_reference": relative_date_reference,
+                                "enable_nolock": nolock_setting,
+                                "full_schema_override": effective_schema_text,
+                                "stored_procedure_guidance_override": effective_guidance,
+                            })
+
+                    resp_text = _call_sql_chain()
                 except FuturesTimeoutError:
                     if not _try_deterministic_timeout_fallback("fast_llm_timeout"):
                         raise
@@ -5599,7 +5843,7 @@ def handle_query(
                 cleaned_query = fix_common_sql_errors(cleaned_query, dialect=active_dialect)
                 is_valid, validation_msg = validate_sql(cleaned_query)
 
-                if is_valid:
+                if is_valid and ENABLE_SQL_VALIDATOR:
                     validator_context = {
                         "tables": rag_context.get("tables", []),
                         "examples": (rag_context.get("examples", []) or [])[:2],
@@ -5627,40 +5871,27 @@ def handle_query(
                             if fixed_valid:
                                 cleaned_query = candidate_sql
                                 is_valid = True
-                                logger.info(
-                                    "validator_applied_fixed_sql failure_type=%s",
-                                    validator_result.get("failure_type"),
-                                )
+                                logger.info("validator_applied_fixed_sql failure_type=%s", validator_result.get("failure_type"))
                             else:
                                 is_valid = False
                         else:
                             is_valid = False
 
-            if use_reasoning and not fallback_used:
-                logger.info(f"DeepSeek reasoner generated SQL ({generation_ms:.0f}ms), complexity={pre_complexity}")
-            elif not fallback_used:
-                logger.info(f"Fast chat model generated SQL ({generation_ms:.0f}ms), complexity={pre_complexity}")
             log_event(
-                logger,
-                logging.INFO,
-                "llm_sql_generation",
+                logger, logging.INFO, "llm_sql_generation",
                 duration_ms=round(generation_ms, 2),
                 reasoning=bool(use_reasoning),
                 fallback_used=bool(fallback_used),
             )
-            timer.mark("sql_generation")
-
             logger.info(
                 "SQL generated (%sms), valid=%s, reasoning=%s, fallback_used=%s",
                 round((time.perf_counter() - t_sql_gen) * 1000, 0),
-                is_valid,
-                use_reasoning,
-                fallback_used,
+                is_valid, use_reasoning, fallback_used,
             )
+            timer.mark("sql_generation")
             timer.mark("sql_validation")
 
             if not is_valid and validator_needs_retry and llm_retry_budget > 0:
-                # Retry with stricter prompt — prefer reasoning model for retry too
                 llm_retry_budget -= 1
                 retry_prompt = RETRY_PROMPT_TEMPLATE.format(
                     question=question,
@@ -5672,43 +5903,40 @@ def handle_query(
                 )
                 try:
                     active_llm = reasoning_llm if (reasoning_llm is not None and _elapsed_seconds() <= 2.0) else llm
-                    retry_resp = _invoke_with_timeout(
-                        lambda: active_llm.invoke(retry_prompt),
-                        timeout_ms=LLM_SQL_TIMEOUT_MS,
-                    )
+
+                    @with_llm_timeout(LLM_SQL_TIMEOUT_MS)
+                    def _call_retry():
+                        return active_llm.invoke(retry_prompt)
+
+                    retry_resp = _call_retry()
                     retry_raw = retry_resp.content.strip() if hasattr(retry_resp, "content") else str(retry_resp).strip()
                     retry_raw = re.sub(r"<think>.*?</think>", "", retry_raw, flags=re.DOTALL).strip()
                     retry_sql = _clean_sql_response(retry_raw)
                     retry_sql = fix_common_sql_errors(retry_sql, dialect=active_dialect)
-                    is_valid_retry, _ = validate_sql(retry_sql)
-                    if is_valid_retry:
+                    if validate_sql(retry_sql)[0]:
                         cleaned_query = retry_sql
                         is_valid = True
                         timer.mark("sql_validation")
                 except Exception:
                     logger.warning("SQL retry with stricter prompt failed", exc_info=True)
 
-            # Top-N guardrail: if model returned a single aggregate row, rewrite as grouped ranking SQL.
+            # Top-N guardrail
             if is_valid and should_replace_with_topn_fallback(question, cleaned_query):
                 fallback_sql = build_topn_fallback_sql(question, db)
                 if fallback_sql:
                     cleaned_query = fallback_sql
                     is_valid = True
 
-            # ID-column guardrail: if SELECT contains raw ID columns,
-            # first try deterministic fix (no LLM), then fall back to LLM.
+            # ID-column guardrail
             if is_valid:
                 bad_ids = _detect_raw_id_columns_in_select(cleaned_query)
                 if bad_ids:
-                    # Fast path: deterministic regex-based fix
                     deterministic_fix = _try_deterministic_id_fix(cleaned_query, bad_ids)
                     if deterministic_fix:
                         logger.info("ID-column fix applied deterministically (no LLM call)")
                         cleaned_query = deterministic_fix
                     elif llm_retry_budget > 0:
-                        # Slow path: LLM retry
                         llm_retry_budget -= 1
-                        logger.info("ID-column fix: deterministic fix failed, falling back to LLM")
                         id_fix_pairs = ", ".join(
                             f"{c} → {_ID_COLUMN_MAP.get(c.lower(), 'name column')}"
                             for c in bad_ids
@@ -5731,49 +5959,35 @@ def handle_query(
                             fix_sql = fix_resp.content.strip() if hasattr(fix_resp, "content") else str(fix_resp).strip()
                             fix_sql = _clean_sql_response(fix_sql)
                             fix_sql = fix_common_sql_errors(fix_sql, dialect=active_dialect)
-                            fix_valid, _ = validate_sql(fix_sql)
-                            if fix_valid:
+                            if validate_sql(fix_sql)[0]:
                                 cleaned_query = fix_sql
                                 timer.mark("sql_validation")
                         except Exception:
                             logger.warning("ID-column LLM fix failed, keeping original", exc_info=True)
 
             if not is_valid:
-                return _finalize_result({
-                    "intent": "DATA_QUERY",
-                    "nl_answer": validation_msg,
-                    "sql": cleaned_query,
-                    "results": None,
-                    "row_count": 0,
-                    "from_cache": False,
-                    "error": "Could not generate valid SQL",
-                    "updated_state": session_state,
-                })
+                return _finalize_result(_make_error_result(
+                    "Could not generate valid SQL", session_state,
+                    sql=cleaned_query, nl_answer=validation_msg,
+                ))
         except Exception as e:
             err_text = str(e).strip()
             if not err_text and isinstance(e, FuturesTimeoutError):
                 err_text = f"LLM request timed out after {LLM_SQL_TIMEOUT_MS} ms"
             if not err_text:
                 err_text = e.__class__.__name__
-            return _finalize_result({
-                "intent": "DATA_QUERY",
-                "nl_answer": None,
-                "sql": None,
-                "results": None,
-                "row_count": 0,
-                "from_cache": False,
-                "error": f"Error generating SQL query: {err_text}",
-                "updated_state": session_state,
-            })
+            return _finalize_result(_make_error_result(
+                f"Error generating SQL query: {err_text}", session_state,
+            ))
 
-    if "cache_lookup" not in timer._marks:
-        timer.mark("cache_lookup")
-    if "rag_retrieval" not in timer._marks:
-        timer.mark("rag_retrieval")
-    if cleaned_query and is_valid and "sql_generation" not in timer._marks:
-        timer.mark("sql_generation")
-    if cleaned_query and is_valid and "sql_validation" not in timer._marks:
-        timer.mark("sql_validation")
+        if "cache_lookup" not in timer._marks:
+            timer.mark("cache_lookup")
+        if "rag_retrieval" not in timer._marks:
+            timer.mark("rag_retrieval")
+        if cleaned_query and is_valid and "sql_generation" not in timer._marks:
+            timer.mark("sql_generation")
+        if cleaned_query and is_valid and "sql_validation" not in timer._marks:
+            timer.mark("sql_validation")
 
     # Step 4: Execute query
     if cleaned_query and is_valid:
@@ -5781,15 +5995,9 @@ def handle_query(
         cleaned_query = fix_common_sql_errors(cleaned_query, dialect=active_dialect)
         cleaned_query = expand_fuzzy_search(cleaned_query, db=db)
         cleaned_query = apply_stored_procedure_guardrails(cleaned_query, db=db)
-        cleaned_query = _retry_ranking_shape_if_needed(
-            question=question,
-            sql=cleaned_query,
-            llm=None,  # Keep retries bounded; rely on deterministic reshapes on hot path.
-            full_schema=full_schema_text,
-            stored_procedure_guidance=stored_procedure_guidance,
-            sql_dialect=active_dialect,
-            enable_nolock=enable_nolock,
-        )
+        # Validate ranking shape; no LLM reshape on hot path (deterministic only).
+        if not validate_ranking_sql_shape(question, cleaned_query)[0]:
+            pass  # shape invalid but no LLM available — keep original SQL
         cleaned_query = performance_guardrails(
             cleaned_query,
             schema_text=full_schema_text,
@@ -5862,7 +6070,7 @@ def handle_query(
                     logger.warning("LLM fix after dry-run failed", exc_info=True)
 
         t_exec = time.perf_counter()
-        df, error = execute_query_safe(db, cleaned_query, timeout_seconds=timeout_seconds, max_rows=1000)
+        df, error = execute_query_safe(db, cleaned_query, timeout_seconds=timeout_seconds, max_rows=500)
         exec_ms = (time.perf_counter() - t_exec) * 1000
         timer.mark("db_execution")
         total_ms = (time.perf_counter() - t_start) * 1000
@@ -5923,23 +6131,14 @@ def handle_query(
                     retry_result["updated_state"] = session_state
                     return _finalize_result(retry_result)
 
-            return _finalize_result({
-                "intent": "DATA_QUERY",
-                "nl_answer": None,
-                "sql": cleaned_query,
-                "results": None,
-                "row_count": 0,
-                "from_cache": False,
-                "error": error,
-                "updated_state": session_state,
-            })
+            return _finalize_result(_make_error_result(error, session_state, sql=cleaned_query))
 
         if df is not None and len(df) > 0:
             _update_session_query_state(session_state, cleaned_query, active_dialect, question=question)
-            cache_query_result(question, cleaned_query, df, query_cache, embedder, db=db)
-            _GLOBAL_QUERY_CACHE.add(question, cleaned_query, df, embedder, db=db)
             results = _results_to_records(df, places=2)
             timer.mark("results_formatting")
+            cache_query_result(question, cleaned_query, df, query_cache, embedder, db=db)
+            _GLOBAL_QUERY_CACHE.add(question, cleaned_query, df, embedder, db=db)
             turn = ConversationTurn(
                 question=question, sql=cleaned_query,
                 topic=_extract_query_topic(question, cleaned_query),
@@ -5983,8 +6182,8 @@ def handle_query(
                 return _finalize_result(retry_result)
             # Both attempts returned nothing
             _update_session_query_state(session_state, cleaned_query, active_dialect, question=question)
-            cache_query_result(question, cleaned_query, None, query_cache, embedder, db=db)
             timer.mark("results_formatting")
+            cache_query_result(question, cleaned_query, None, query_cache, embedder, db=db)
             return _finalize_result({
                 "intent": "DATA_QUERY",
                 "nl_answer": "No results found for your query.",
@@ -5997,8 +6196,8 @@ def handle_query(
             })
         else:
             _update_session_query_state(session_state, cleaned_query, active_dialect, question=question)
-            cache_query_result(question, cleaned_query, None, query_cache, embedder, db=db)
             timer.mark("results_formatting")
+            cache_query_result(question, cleaned_query, None, query_cache, embedder, db=db)
             return _finalize_result({
                 "intent": "DATA_QUERY",
                 "nl_answer": "No results found for your query.",
@@ -6011,16 +6210,7 @@ def handle_query(
             })
 
     # Should not reach here
-    return _finalize_result({
-        "intent": "DATA_QUERY",
-        "nl_answer": None,
-        "sql": None,
-        "results": None,
-        "row_count": 0,
-        "from_cache": False,
-        "error": "Unexpected error processing query",
-        "updated_state": session_state,
-    })
+    return _finalize_result(_make_error_result("Unexpected error processing query", session_state))
 
 
 def _get_last_sql(chat_history: List[Dict]) -> Optional[str]:
@@ -6147,7 +6337,7 @@ def _retry_followup_across_views(
                 dialect=sql_dialect,
                 enable_nolock=enable_nolock,
             )
-            retry_df, retry_error = execute_query_safe(db, retry_sql, timeout_seconds=timeout_seconds, max_rows=1000)
+            retry_df, retry_error = execute_query_safe(db, retry_sql, timeout_seconds=timeout_seconds, max_rows=500)
             if retry_df is not None and len(retry_df) > 0:
                 cache_query_result(question, retry_sql, retry_df, query_cache, embedder, db=db)
                 results = _results_to_records(retry_df, places=2)

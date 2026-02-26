@@ -69,6 +69,7 @@ export default function Sidebar({ user, connected, onConnected }: Props) {
         temperature: values.temperature,
         query_timeout: values.query_timeout,
         view_support: values.view_support,
+        enable_nolock: values.enable_nolock,
       });
 
       if (result.success) {
@@ -133,17 +134,18 @@ export default function Sidebar({ user, connected, onConnected }: Props) {
         layout="vertical"
         size="small"
         initialValues={{
-          llm_provider: 'DeepSeek',
-          model: 'deepseek-chat',
+          llm_provider: 'OpenAI',
+          model: 'gpt-4o-mini',
           temperature: 0,
-          host: '95.168.168.71',
-          port: '1988',
-          db_username: 'withinearth_reader',
-          db_password: 'pass@readerWE#2026',
-          database: 'mis_report_data',
-          api_key: 'sk-553b82b11de04693a5a8ad23a1862347',
+          host: '',
+          port: '',
+          db_username: '',
+          db_password: '',
+          database: '',
+          api_key: '',
           query_timeout: 60,
           view_support: true,
+          enable_nolock: true,
         }}
       >
         {/* LLM Settings */}
@@ -177,8 +179,10 @@ export default function Sidebar({ user, connected, onConnected }: Props) {
                         { value: 'deepseek-coder', label: 'deepseek-coder' },
                       ]
                     : [
-                        { value: 'gpt-4', label: 'GPT-4' },
+                        { value: 'gpt-4o-mini', label: 'GPT-4o Mini (Recommended)' },
+                        { value: 'gpt-4o', label: 'GPT-4o' },
                         { value: 'gpt-4-turbo', label: 'GPT-4 Turbo' },
+                        { value: 'gpt-4', label: 'GPT-4' },
                         { value: 'gpt-3.5-turbo', label: 'GPT-3.5 Turbo' },
                       ]
                 }
@@ -226,6 +230,15 @@ export default function Sidebar({ user, connected, onConnected }: Props) {
         </Form.Item>
 
         <Form.Item label="View Support" name="view_support" valuePropName="checked">
+          <Switch disabled={!isAdmin} />
+        </Form.Item>
+
+        <Form.Item
+          label="NOLOCK reads (SQL Server)"
+          name="enable_nolock"
+          valuePropName="checked"
+          tooltip="Adds WITH (NOLOCK) to all queries. Faster on read-only analytics DBs but may read uncommitted data."
+        >
           <Switch disabled={!isAdmin} />
         </Form.Item>
       </Form>

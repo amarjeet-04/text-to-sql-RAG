@@ -19,6 +19,7 @@ import {
   ExperimentOutlined,
   RobotOutlined,
   SettingOutlined,
+  TeamOutlined,
 } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import ChatMessage from '../components/ChatMessage';
@@ -304,6 +305,15 @@ export default function ChatPage() {
                 size="small"
               >
                 Settings
+              </Button>
+            )}
+            {user.role === 'Admin' && (
+              <Button
+                icon={<TeamOutlined />}
+                onClick={() => navigate('/admin')}
+                size="small"
+              >
+                Users
               </Button>
             )}
             {user.role === 'Admin' && (

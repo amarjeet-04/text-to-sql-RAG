@@ -3,16 +3,14 @@ import asyncio
 import json
 import logging
 import os
-import re
 import threading
 import time
 from collections import OrderedDict
-from concurrent.futures import TimeoutError as FuturesTimeoutError
 from contextvars import copy_context
 from datetime import datetime
 from typing import Optional, List, Any, Dict
 
-import httpx
+from openai import AsyncOpenAI
 from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -22,11 +20,9 @@ from backend.services.sql_engine import (
     handle_query as legacy_handle_query,
     generate_nl_response,
     detect_intent_simple,
-    build_domain_digest,
-    _read_stored_procedure_file,
     invalidate_runtime_caches,
+    StepTimer,
 )
-from backend.services.guarded_text2sql_pipeline import handle_query as guarded_handle_query
 from backend.services.runtime import (
     run_with_timeout,
     log_event,
@@ -34,13 +30,9 @@ from backend.services.runtime import (
     get_foreground_executor,
 )
 from backend.routes.deps import get_session
-from app.db_utils import execute_query_safe, validate_sql_dry_run
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
-USE_GUARDED_PIPELINE = os.getenv("USE_GUARDED_PIPELINE", "true").lower() in {"1", "true", "yes", "on"}
 logger = logging.getLogger("chat_route")
-GUARDED_PIPELINE_BUDGET_S = max(5.0, float(os.getenv("GUARDED_PIPELINE_BUDGET_S", "20")))
-GUARDED_SCHEMA_CHAR_BUDGET = max(4000, int(os.getenv("GUARDED_SCHEMA_CHAR_BUDGET", "8000")))
 NL_RESPONSE_TTL_SECONDS = max(30, int(os.getenv("NL_RESPONSE_TTL_SECONDS", "180")))
 NL_RESPONSE_MAX_ENTRIES = max(64, int(os.getenv("NL_RESPONSE_MAX_ENTRIES", "512")))
 NL_STREAM_WAIT_SECONDS = max(2.0, float(os.getenv("NL_STREAM_WAIT_SECONDS", "15")))
@@ -49,220 +41,35 @@ _NL_RESPONSE_TASKS: Dict[str, asyncio.Task] = {}
 _NL_LOCK = threading.RLock()
 
 
-class _LLMAdapter:
-    """Adapter to satisfy llm.chat(messages, timeout_s) expected by guarded pipeline."""
+def _normalize_stage_timing(
+    timing: Optional[Dict[str, Any]],
+    *,
+    total_ms: Optional[float] = None,
+) -> Dict[str, float]:
+    out: Dict[str, float] = {stage: 0.0 for stage in StepTimer.STAGES}
+    extras: Dict[str, float] = {}
 
-    def __init__(self, llm):
-        self._llm = llm
-
-    def chat(self, messages: List[Dict[str, str]], timeout_s: float) -> str:
-        prompt = "\n\n".join(str(m.get("content", "")) for m in messages or [])
-        started = time.perf_counter()
-
-        def _invoke():
-            resp = self._llm.invoke(prompt)
-            return resp.content if hasattr(resp, "content") else str(resp)
-
+    raw = timing if isinstance(timing, dict) else {}
+    for stage, value in raw.items():
+        if not isinstance(stage, str):
+            continue
         try:
-            out = run_with_timeout(_invoke, timeout_s=max(0.1, float(timeout_s)))
-            log_event(
-                logger,
-                logging.INFO,
-                "guarded_llm_call_ok",
-                timeout_s=float(timeout_s),
-                elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
-                prompt_chars=len(prompt),
-            )
-            return out
-        except FuturesTimeoutError as exc:
-            log_event(
-                logger,
-                logging.WARNING,
-                "guarded_llm_call_timeout",
-                timeout_s=float(timeout_s),
-                elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
-                prompt_chars=len(prompt),
-            )
-            raise TimeoutError(f"llm_timeout_{timeout_s}s") from exc
-
-
-def _compact_schema_for_guarded(schema_text: str, table_hints: List[str]) -> str:
-    text = schema_text or ""
-    if len(text) <= GUARDED_SCHEMA_CHAR_BUDGET:
-        return text
-    hints = {h.lower().strip() for h in table_hints if isinstance(h, str) and h.strip()}
-    if not hints:
-        return text[:GUARDED_SCHEMA_CHAR_BUDGET]
-
-    # Keep CREATE TABLE blocks matching hints first.
-    blocks = re.split(r"(?i)(?=CREATE\s+TABLE\s+)", text)
-    selected: List[str] = []
-    for block in blocks:
-        low = block.lower()
-        if any(h in low for h in hints):
-            selected.append(block)
-        if sum(len(x) for x in selected) >= GUARDED_SCHEMA_CHAR_BUDGET:
-            break
-    if not selected:
-        return text[:GUARDED_SCHEMA_CHAR_BUDGET]
-    compact = "\n\n".join(selected)
-    return compact[:GUARDED_SCHEMA_CHAR_BUDGET]
-
-
-def _rows_from_df(df) -> List[Dict[str, Any]]:
-    if df is None:
-        return []
-    try:
-        return df.to_dict(orient="records")
-    except Exception:
-        return []
-
-
-def _run_guarded_data_query(req: "QueryRequest", session: Session) -> Dict[str, Any]:
-    question = req.question
-    schema_compact = session.cached_schema_text or (session.db.get_table_info() if session.db is not None else "")
-    rules_compact = build_domain_digest(_read_stored_procedure_file())
-
-    retrieved_tables_hint: List[str] = []
-    if session.rag_engine is not None:
-        try:
-            rag_ctx = session.rag_engine.retrieve(question, top_k=2, fast_mode=True, skip_for_followup=False, intent_key="chat")
-            retrieved_tables_hint = list(rag_ctx.get("tables", []) or [])[:6]
-        except TypeError:
-            try:
-                rag_ctx = session.rag_engine.retrieve(question, top_k=2)
-                retrieved_tables_hint = list(rag_ctx.get("tables", []) or [])[:6]
-            except Exception:
-                retrieved_tables_hint = []
+            parsed = round(float(value), 2)
         except Exception:
-            retrieved_tables_hint = []
+            continue
+        if stage in out:
+            out[stage] = parsed
+        else:
+            extras[stage] = parsed
 
-    schema_compact = _compact_schema_for_guarded(schema_compact, retrieved_tables_hint)
-    log_event(
-        logger,
-        logging.INFO,
-        "guarded_prompt_payload",
-        schema_chars=len(schema_compact or ""),
-        rules_chars=len(rules_compact or ""),
-        hint_tables=len(retrieved_tables_hint),
-    )
-
-    llm_adapter = _LLMAdapter(session.llm)
-    timeout_seconds = max(5, int(getattr(session.db_config, "query_timeout", 30)))
-    # Cap the guarded pipeline's DB execution at 20 s so a slow complex SQL
-    # fails fast and the outer exception handler falls back to the legacy
-    # pipeline (which generates simpler, faster SQL from its own cache/LLM).
-    guarded_db_timeout = min(timeout_seconds, 20)
-
-    def _db_execute(sql: str):
-        df, err = execute_query_safe(session.db, sql, timeout_seconds=guarded_db_timeout, max_rows=1000)
-        if err:
-            raise RuntimeError(err)
-        return _rows_from_df(df)
-
-    def _db_dry_run(sql: str):
-        ok, err = validate_sql_dry_run(session.db, sql)
-        return bool(ok), (err or "")
-
-    guarded_result = guarded_handle_query(
-        question=question,
-        schema_compact=schema_compact,
-        rules_compact=rules_compact,
-        retrieved_tables_hint=retrieved_tables_hint,
-        db_execute=_db_execute,
-        db_dry_run=_db_dry_run,
-        llm=llm_adapter,
-        dialect="mssql",
-        current_date=datetime.now().strftime("%Y-%m-%d"),
-        budget_seconds=GUARDED_PIPELINE_BUDGET_S,
-    )
-
-    status = guarded_result.get("status")
-    sql = guarded_result.get("sql")
-    rows = guarded_result.get("rows")
-    elapsed_ms = int(guarded_result.get("elapsed_ms") or 0)
-    reason = guarded_result.get("reason") or ""
-    intent_json = guarded_result.get("intent_json") or {}
-
-    # If the guarded pipeline hit the time budget but produced a valid SQL,
-    # try to execute it directly here rather than falling back to the slow legacy path.
-    if status == "timeout" and sql and not rows:
+    if total_ms is not None:
         try:
-            timeout_seconds = max(5, int(getattr(session.db_config, "query_timeout", 30)))
-            df, exec_err = execute_query_safe(session.db, sql, timeout_seconds=timeout_seconds, max_rows=1000)
-            if not exec_err and df is not None:
-                rows = _rows_from_df(df)
-                status = "ok"    # promote to success
-                reason = ""
-                log_event(logger, logging.INFO, "guarded_budget_exceeded_but_executed",
-                          rows=len(rows), sql_chars=len(sql))
+            out["total"] = round(float(total_ms), 2)
         except Exception:
-            pass  # fall through to raise below
+            pass
 
-    # If guarded pipeline timed out (LLM call timeout, budget exceeded, or DB
-    # execution timeout on a complex guarded SQL), raise so the outer try/except
-    # in query() falls back to the legacy pipeline which generates simpler SQL.
-    if status == "timeout" or (
-        status == "error" and (
-            "timeout" in reason.lower()
-            or "query timed out" in reason.lower()
-            or "query_timeout" in reason.lower()
-        )
-    ):
-        raise TimeoutError(f"guarded_pipeline_timeout: {reason}")
-
-    # Update minimal structured memory for follow-ups.
-    if sql:
-        session.session_state.last_sql = sql
-        session.session_state.last_table = (intent_json.get("tables_used") or [None])[0]
-        tw = intent_json.get("time_window") or {}
-        session.session_state.last_time_window = {
-            "start": tw.get("start"),
-            "end": tw.get("end_exclusive"),
-        }
-        session.session_state.last_dimensions = [str(x) for x in (intent_json.get("group_by") or [])][:6]
-        session.session_state.last_metrics = [k for k, v in (intent_json.get("metrics") or {}).items() if v][:6]
-        session.session_state.last_filters = ["booking_status_exclusions"] if (intent_json.get("filters") or {}).get("booking_status_exclusions") else []
-
-    if status == "ok":
-        out_rows = rows if isinstance(rows, list) else []
-        turn = ConversationTurn(
-            question=question,
-            sql=sql,
-            topic="guarded:data",
-            columns=list(out_rows[0].keys()) if out_rows else [],
-            row_count=len(out_rows),
-            status="ok",
-        )
-        return {
-            "intent": "DATA_QUERY",
-            "nl_answer": None,
-            "sql": sql,
-            "results": out_rows,
-            "row_count": len(out_rows),
-            "from_cache": False,
-            "error": None,
-            "updated_state": session.session_state.to_dict(),
-            "nl_pending": len(out_rows) > 0,
-            "conversation_turn": turn,
-            "fallback_used": False,
-            "timing": {"total": float(elapsed_ms)},
-        }
-
-    # rejected/timeout/error
-    return {
-        "intent": "DATA_QUERY",
-        "nl_answer": reason if isinstance(reason, str) and reason else ("Query rejected by guarded pipeline." if status == "rejected" else None),
-        "sql": sql,
-        "results": [] if status != "error" else None,
-        "row_count": 0,
-        "from_cache": False,
-        "error": reason if status in {"rejected", "error"} else None,
-        "updated_state": session.session_state.to_dict(),
-        "nl_pending": False,
-        "fallback_used": bool(status == "timeout" and sql),
-        "timing": {"total": float(elapsed_ms)},
-    }
+    out.update(extras)
+    return out
 
 
 def _nl_cache_key(session_token: str, request_id: str) -> str:
@@ -348,12 +155,6 @@ def _extract_secret(value: Any) -> str:
     return str(value).strip()
 
 
-def _is_deepseek_llm(llm: Any) -> bool:
-    model_name = str(getattr(llm, "model_name", "") or getattr(llm, "model", "")).lower()
-    api_base = str(getattr(llm, "openai_api_base", "")).lower()
-    return "deepseek" in model_name or "deepseek" in api_base
-
-
 def _format_results_for_nl(results: Optional[List[Any]]) -> str:
     if not results or not isinstance(results, list):
         return "No results found."
@@ -394,78 +195,51 @@ def _build_nl_messages(question: str, results: Optional[List[Any]]) -> List[Dict
     ]
 
 
-async def _deepseek_nl_answer_async(question: str, results: Optional[List[Any]], llm: Any) -> str:
-    model_name = str(getattr(llm, "model_name", "") or "deepseek-chat")
-    api_base = str(getattr(llm, "openai_api_base", "") or "https://api.deepseek.com").rstrip("/")
+def _get_openai_client(llm: Any) -> Optional[AsyncOpenAI]:
     api_key = _extract_secret(getattr(llm, "openai_api_key", None))
     if not api_key:
-        return ""
-    timeout = httpx.Timeout(connect=5.0, read=45.0, write=20.0, pool=10.0)
-    payload = {
-        "model": model_name,
-        "messages": _build_nl_messages(question, results),
-        "temperature": 0.0,
-        "stream": False,
-    }
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    async with httpx.AsyncClient(timeout=timeout, http2=True) as client:
-        resp = await client.post(f"{api_base}/chat/completions", headers=headers, json=payload)
-        resp.raise_for_status()
-        body = resp.json()
-    try:
-        return str(body["choices"][0]["message"]["content"]).strip()
-    except Exception:
-        return ""
-
-
-async def _deepseek_nl_token_stream(question: str, results: Optional[List[Any]], llm: Any):
-    model_name = str(getattr(llm, "model_name", "") or "deepseek-chat")
-    api_base = str(getattr(llm, "openai_api_base", "") or "https://api.deepseek.com").rstrip("/")
-    api_key = _extract_secret(getattr(llm, "openai_api_key", None))
+        api_key = os.getenv("OPENAI_API_KEY", "")
     if not api_key:
+        return None
+    api_base = str(getattr(llm, "openai_api_base", "") or "").rstrip("/") or None
+    return AsyncOpenAI(api_key=api_key, base_url=api_base)
+
+
+async def _openai_nl_token_stream(question: str, results: Optional[List[Any]], llm: Any):
+    client = _get_openai_client(llm)
+    if client is None:
         return
-    timeout = httpx.Timeout(connect=5.0, read=60.0, write=20.0, pool=10.0)
-    payload = {
-        "model": model_name,
-        "messages": _build_nl_messages(question, results),
-        "temperature": 0.0,
-        "stream": True,
-    }
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    async with httpx.AsyncClient(timeout=timeout, http2=True) as client:
-        async with client.stream("POST", f"{api_base}/chat/completions", headers=headers, json=payload) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if not line:
-                    continue
-                if not line.startswith("data:"):
-                    continue
-                payload_line = line[5:].strip()
-                if payload_line == "[DONE]":
-                    break
-                try:
-                    parsed = json.loads(payload_line)
-                except Exception:
-                    continue
-                choices = parsed.get("choices") or []
-                if not choices:
-                    continue
-                delta = choices[0].get("delta") or {}
-                token = delta.get("content")
-                if token:
-                    yield str(token)
+    model_name = str(getattr(llm, "model_name", "") or getattr(llm, "model", "") or "gpt-4o-mini")
+    async with client:
+        stream = await client.chat.completions.create(
+            model=model_name,
+            messages=_build_nl_messages(question, results),
+            temperature=0.0,
+            stream=True,
+        )
+        async for chunk in stream:
+            token = (chunk.choices[0].delta.content or "") if chunk.choices else ""
+            if token:
+                yield token
 
 
 async def _generate_nl_answer_async(question: str, results: Optional[List[Any]], llm: Any) -> str:
     if llm is None:
         return ""
-    if _is_deepseek_llm(llm):
+    client = _get_openai_client(llm)
+    if client is not None:
         try:
-            answer = await _deepseek_nl_answer_async(question, results, llm)
-            if answer:
-                return answer
+            model_name = str(getattr(llm, "model_name", "") or getattr(llm, "model", "") or "gpt-4o-mini")
+            async with client:
+                resp = await client.chat.completions.create(
+                    model=model_name,
+                    messages=_build_nl_messages(question, results),
+                    temperature=0.0,
+                    stream=False,
+                )
+            return str(resp.choices[0].message.content or "").strip()
         except Exception:
-            logger.warning("deepseek_async_nl_generation_failed", exc_info=True)
+            logger.warning("openai_async_nl_generation_failed", exc_info=True)
     loop = asyncio.get_running_loop()
     answer = await loop.run_in_executor(
         get_foreground_executor(), generate_nl_response, question, results, llm
@@ -563,17 +337,18 @@ class QueryRequest(BaseModel):
 
 
 class QueryResponse(BaseModel):
-    intent:       Optional[str]        = None
-    nl_answer:    Optional[str]        = None
-    sql:          Optional[str]        = None
-    results:      Optional[List[Any]]  = None
-    row_count:    int                  = 0
-    from_cache:   bool                 = False
-    error:        Optional[str]        = None
-    nl_pending:   bool                 = False
-    fallback_used: bool                = False
-    timing:       Optional[Dict[str, float]] = None
-    request_id:   Optional[str]        = None
+    intent:           Optional[str]        = None
+    nl_answer:        Optional[str]        = None
+    sql:              Optional[str]        = None
+    results:          Optional[List[Any]]  = None
+    row_count:        int                  = 0
+    from_cache:       bool                 = False
+    error:            Optional[str]        = None
+    nl_pending:       bool                 = False
+    fallback_used:    bool                 = False
+    timing:           Optional[Dict[str, float]] = None
+    request_id:       Optional[str]        = None
+    query_complexity: Optional[str]        = None  # "deterministic" | "simple_llm" | "complex_llm"
 
 
 class NLRequest(BaseModel):
@@ -607,15 +382,11 @@ async def query(req: QueryRequest, request: Request, session: Session = Depends(
         logging.INFO,
         "chat_query_start",
         path=str(request.url.path),
-        guarded_enabled=USE_GUARDED_PIPELINE,
         question_len=len(req.question or ""),
     )
 
-    intent_hint = detect_intent_simple(req.question) or ""
-    use_guarded = USE_GUARDED_PIPELINE and intent_hint not in {"GREETING", "THANKS", "HELP", "FAREWELL", "OUT_OF_SCOPE", "CLARIFICATION_NEEDED"}
-
     try:
-        def _run_legacy() -> Dict[str, Any]:
+        def _query_worker() -> Dict[str, Any]:
             return legacy_handle_query(
                 question=req.question,
                 db=session.db,
@@ -633,15 +404,6 @@ async def query(req: QueryRequest, request: Request, session: Session = Depends(
                 sql_dialect=session.sql_dialect,
                 enable_nolock=session.enable_nolock,
             )
-
-        def _query_worker() -> Dict[str, Any]:
-            if use_guarded:
-                try:
-                    return _run_guarded_data_query(req, session)
-                except Exception:
-                    logger.warning("guarded_pipeline_failed_falling_back", exc_info=True)
-                    return _run_legacy()
-            return _run_legacy()
 
         loop = asyncio.get_running_loop()
         ctx = copy_context()
@@ -701,21 +463,31 @@ async def query(req: QueryRequest, request: Request, session: Session = Depends(
             row_count=int(result.get("row_count", 0) or 0),
             has_error=bool(result.get("error")),
         )
+        raw_timing = result.get("timing")
+        has_total = isinstance(raw_timing, dict) and "total" in raw_timing
+        normalized_timing = _normalize_stage_timing(
+            raw_timing,
+            total_ms=None if has_total else float(elapsed_ms),
+        )
         return QueryResponse(
-            intent        = result.get("intent"),
-            nl_answer     = result.get("nl_answer"),
-            sql           = result.get("sql"),
-            results       = result.get("results"),
-            row_count     = result.get("row_count", 0),
-            from_cache    = result.get("from_cache", False),
-            error         = result.get("error"),
-            nl_pending    = result.get("nl_pending", False),
-            fallback_used = result.get("fallback_used", False),
-            timing        = result.get("timing"),
-            request_id    = request_id,
+            intent            = result.get("intent"),
+            nl_answer         = result.get("nl_answer"),
+            sql               = result.get("sql"),
+            results           = result.get("results"),
+            row_count         = result.get("row_count", 0),
+            from_cache        = result.get("from_cache", False),
+            error             = result.get("error"),
+            nl_pending        = result.get("nl_pending", False),
+            fallback_used     = result.get("fallback_used", False),
+            timing            = normalized_timing,
+            request_id        = request_id,
+            query_complexity  = result.get("query_complexity"),
         )
     except Exception:
         logger.exception("chat_query_unhandled_error")
+        error_timing = _normalize_stage_timing(
+            {"total": round((time.perf_counter() - started) * 1000.0, 2)}
+        )
         return QueryResponse(
             intent="DATA_QUERY",
             nl_answer=None,
@@ -726,7 +498,7 @@ async def query(req: QueryRequest, request: Request, session: Session = Depends(
             error="Internal error while processing query.",
             nl_pending=False,
             fallback_used=False,
-            timing={"total": round((time.perf_counter() - started) * 1000.0, 2)},
+            timing=error_timing,
             request_id=request_id,
         )
 
@@ -814,57 +586,35 @@ async def nl_stream(request: Request, request_id: str, session: Session = Depend
 
         question = str(state.get("question") or "")
         results = state.get("results") if isinstance(state.get("results"), list) else []
-        if _is_deepseek_llm(session.llm):
-            with _NL_LOCK:
-                running = _NL_RESPONSE_TASKS.pop(key, None)
-            if running is not None and not running.done():
-                running.cancel()
-            try:
-                parts: List[str] = []
-                async for token in _deepseek_nl_token_stream(question, results, session.llm):
-                    if await request.is_disconnected():
-                        return
-                    parts.append(token)
-                    yield _sse_event("token", {"request_id": request_id, "token": token})
-                answer_text = "".join(parts).strip() or "No summary available."
-                _set_nl_state(
-                    session_token=session.token,
-                    request_id=request_id,
-                    status="ready",
-                    question=question,
-                    results=results,
-                    nl_answer=answer_text,
-                    error=None,
-                )
-                _update_chat_history_nl(session, request_id, answer_text)
-                yield _sse_event("done", {"request_id": request_id, "nl_answer": answer_text})
-                return
-            except Exception:
-                logger.warning("nl_stream_deepseek_live_stream_failed", exc_info=True)
 
-        deadline = time.monotonic() + NL_STREAM_WAIT_SECONDS
-        while time.monotonic() < deadline:
-            if await request.is_disconnected():
-                return
-            state = _get_nl_state(session_token=session.token, request_id=request_id)
-            if state is None:
-                yield _sse_event("error", {"request_id": request_id, "error": "nl_state_not_found"})
-                return
-            status = str(state.get("status") or "pending")
-            if status == "ready":
-                answer_text = str(state.get("nl_answer") or "")
-                for token in _stream_tokens_from_text(answer_text):
-                    if await request.is_disconnected():
-                        return
-                    yield _sse_event("token", {"request_id": request_id, "token": token})
-                yield _sse_event("done", {"request_id": request_id, "nl_answer": answer_text})
-                return
-            if status == "error":
-                yield _sse_event("error", {"request_id": request_id, "error": state.get("error") or "nl_generation_failed"})
-                return
-            await asyncio.sleep(0.12)
+        # Cancel any pending background task — we'll stream live instead
+        with _NL_LOCK:
+            running = _NL_RESPONSE_TASKS.pop(key, None)
+        if running is not None and not running.done():
+            running.cancel()
 
-        yield _sse_event("error", {"request_id": request_id, "error": "nl_stream_timeout"})
+        try:
+            parts: List[str] = []
+            async for token in _openai_nl_token_stream(question, results, session.llm):
+                if await request.is_disconnected():
+                    return
+                parts.append(token)
+                yield _sse_event("token", {"request_id": request_id, "token": token})
+            answer_text = "".join(parts).strip() or "No summary available."
+            _set_nl_state(
+                session_token=session.token,
+                request_id=request_id,
+                status="ready",
+                question=question,
+                results=results,
+                nl_answer=answer_text,
+                error=None,
+            )
+            _update_chat_history_nl(session, request_id, answer_text)
+            yield _sse_event("done", {"request_id": request_id, "nl_answer": answer_text})
+        except Exception:
+            logger.warning("nl_stream_live_stream_failed", exc_info=True)
+            yield _sse_event("error", {"request_id": request_id, "error": "nl_stream_failed"})
 
     return StreamingResponse(
         _event_generator(),

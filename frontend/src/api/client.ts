@@ -38,6 +38,36 @@ export async function login(username: string, password: string): Promise<LoginRe
   return data;
 }
 
+export async function signup(username: string, password: string, name: string): Promise<LoginResponse> {
+  const { data } = await api.post<LoginResponse>('/auth/signup', { username, password, name });
+  return data;
+}
+
+export interface UserInfo {
+  username: string;
+  role: string;
+  name: string;
+}
+
+export async function listUsers(): Promise<UserInfo[]> {
+  const { data } = await api.get<UserInfo[]>('/auth/users');
+  return data;
+}
+
+export async function createUser(
+  username: string,
+  password: string,
+  role: string,
+  name: string,
+): Promise<UserInfo> {
+  const { data } = await api.post<UserInfo>('/auth/users', { username, password, role, name });
+  return data;
+}
+
+export async function deleteUser(username: string): Promise<void> {
+  await api.delete(`/auth/users/${encodeURIComponent(username)}`);
+}
+
 export async function connectDb(req: ConnectRequest): Promise<ConnectResponse> {
   const { data } = await api.post<ConnectResponse>('/db/connect', req, {
     // DB handshake + schema checks on remote servers may take longer than typical API calls.

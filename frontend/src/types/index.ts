@@ -21,6 +21,7 @@ export interface ConnectRequest {
   temperature: number;
   query_timeout: number;
   view_support: boolean;
+  enable_nolock?: boolean;
 }
 
 export interface ConnectResponse {
@@ -29,6 +30,8 @@ export interface ConnectResponse {
   tables_count: number;
   views_count: number;
 }
+
+export type QueryComplexity = 'deterministic' | 'simple_llm' | 'complex_llm';
 
 export interface QueryResponse {
   intent: string | null;
@@ -41,6 +44,7 @@ export interface QueryResponse {
   nl_pending?: boolean;
   timing?: Record<string, number> | null;
   request_id?: string | null;
+  query_complexity?: QueryComplexity | null;
 }
 
 export interface NLStatusResponse {

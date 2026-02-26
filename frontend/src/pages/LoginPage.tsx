@@ -1,7 +1,7 @@
 import { useState } from 'react';
-import { Card, Form, Input, Button, Typography, Alert, Tag, Space, Divider } from 'antd';
+import { Card, Form, Input, Button, Typography, Alert } from 'antd';
 import { UserOutlined, LockOutlined } from '@ant-design/icons';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { login } from '../api/client';
 import logo from '../assets/within_earth_logo.jpg';
 
@@ -68,33 +68,21 @@ export default function LoginPage() {
             <Input.Password prefix={<LockOutlined />} placeholder="Password" />
           </Form.Item>
 
-          <Form.Item>
+          <Form.Item style={{ marginBottom: 12 }}>
             <Button type="primary" htmlType="submit" loading={loading} block>
               Sign In
             </Button>
           </Form.Item>
         </Form>
 
-        <Divider>Demo Credentials</Divider>
-
-        <Space direction="vertical" style={{ width: '100%' }} size="small">
-          <Card size="small" style={{ background: '#f9fafb' }}>
-            <Space>
-              <Tag color="gold">Admin</Tag>
-              <Text code>admin</Text>
-              <Text type="secondary">/</Text>
-              <Text code>admin123</Text>
-            </Space>
-          </Card>
-          <Card size="small" style={{ background: '#f9fafb' }}>
-            <Space>
-              <Tag color="blue">Analyst</Tag>
-              <Text code>analyst</Text>
-              <Text type="secondary">/</Text>
-              <Text code>analyst123</Text>
-            </Space>
-          </Card>
-        </Space>
+        <div style={{ textAlign: 'center' }}>
+          <Text type="secondary">
+            Don't have an account?{' '}
+            <Link to="/signup" style={{ color: '#4F46E5', fontWeight: 500 }}>
+              Sign up
+            </Link>
+          </Text>
+        </div>
       </Card>
     </div>
   );
