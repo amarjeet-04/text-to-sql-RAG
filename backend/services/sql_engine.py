@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from app.db_utils import DatabaseConfig, create_database_with_views, execute_query_safe, get_views_and_tables, validate_sql_dry_run
 from app.rag.rag_engine import RAGEngine
 from backend.services.session import ConversationTurn, SessionState, serialize_conversation_turns
-from backend.services.runtime import run_with_timeout, submit_background_task, log_event
+from backend.services.runtime import run_with_timeout, submit_background_task, log_event, get_request_id, get_session_id
 
 logger = logging.getLogger("sql_engine")
 
@@ -178,64 +178,33 @@ _SCHEMA_RUNTIME_LOCK = threading.RLock()
 
 
 # Singleflight pattern to prevent duplicate expensive work
-_SINGLEFLIGHT_LOCKS: Dict[str, Tuple[threading.Lock, float]] = {}
+_SINGLEFLIGHT_LOCKS: Dict[str, threading.Lock] = {}
+_SINGLEFLIGHT_RESULTS: Dict[str, Any] = {}
 _SINGLEFLIGHT_LOCK = threading.RLock()
-_SINGLEFLIGHT_TTL = 30.0  # 30 seconds TTL for locks
 
 
 def _get_singleflight_lock(key: str) -> threading.Lock:
     """Get or create a singleflight lock for a given key."""
     with _SINGLEFLIGHT_LOCK:
-        now = time.time()
-        
-        # Clean up expired locks
-        expired_keys = [
-            k for k, (lock, timestamp) in _SINGLEFLIGHT_LOCKS.items()
-            if now - timestamp > _SINGLEFLIGHT_TTL
-        ]
-        for k in expired_keys:
-            _SINGLEFLIGHT_LOCKS.pop(k, None)
-        
-        # Return existing or create new lock
-        if key in _SINGLEFLIGHT_LOCKS:
-            lock, timestamp = _SINGLEFLIGHT_LOCKS[key]
-            _SINGLEFLIGHT_LOCKS[key] = (lock, now)  # Update timestamp
-            return lock
-        else:
-            lock = threading.Lock()
-            _SINGLEFLIGHT_LOCKS[key] = (lock, now)
-            return lock
+        if key not in _SINGLEFLIGHT_LOCKS:
+            _SINGLEFLIGHT_LOCKS[key] = threading.Lock()
+        return _SINGLEFLIGHT_LOCKS[key]
 
 
 def singleflight(key: str, fn, *args, **kwargs):
     """
     Singleflight pattern: ensures only one execution of fn happens for a given key.
-    Other concurrent calls wait and return the same result.
-    
-    Args:
-        key: Unique identifier for the operation
-        fn: Function to execute
-        *args, **kwargs: Arguments to pass to fn
-        
-    Returns:
-        Result of fn(*args, **kwargs)
+    Concurrent callers for the same key wait on the lock; the first caller executes
+    fn and stores the result; subsequent callers read and return the stored result.
+    The result entry is cleared after all waiters have read it.
     """
     lock = _get_singleflight_lock(key)
-    
     with lock:
-        # Check if we have a cached result from a previous execution
-        cache_key = f"singleflight_result:{key}"
-        if hasattr(_SINGLEFLIGHT_LOCKS, cache_key):
-            result = getattr(_SINGLEFLIGHT_LOCKS, cache_key)
-            delattr(_SINGLEFLIGHT_LOCKS, cache_key)
+        if key in _SINGLEFLIGHT_RESULTS:
+            result = _SINGLEFLIGHT_RESULTS.pop(key)
             return result
-        
-        # Execute the function
         result = fn(*args, **kwargs)
-        
-        # Store result for other threads that might be waiting
-        setattr(_SINGLEFLIGHT_LOCKS, cache_key, result)
-        
+        _SINGLEFLIGHT_RESULTS[key] = result
         return result
 
 
@@ -5663,6 +5632,7 @@ def handle_query(
 
     cleaned_query = None
     is_valid = False
+    skip_rag_retrieval = True  # default True; set to computed value only on the LLM path
     llm_retry_budget = 1
 
     # Step 3a: "De-clevering" fast-path for vague business overview questions.
@@ -5899,10 +5869,10 @@ def handle_query(
                      examples_count=len(examples),
                      tables_count=len(rag_table_hints),
                      retrieval_skipped=rag_context.get("skipped", False) if rag_context else True)
-            else:
-                few_shot_str = ""
-                log_event(logger, logging.INFO, "rag_retrieval_empty", 
-                         skip_reason="no_examples_found" if rag_context else "background_failed")
+        else:
+            few_shot_str = ""
+            log_event(logger, logging.INFO, "rag_retrieval_empty",
+                     skip_reason="no_examples_found" if rag_context else "background_failed")
 
         prompt_payload = _build_prompt_payload(
             question=question,

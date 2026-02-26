@@ -252,9 +252,14 @@ def _update_chat_history_nl(session: Session, request_id: str, answer: str) -> N
         for item in reversed(session.chat_history):
             if str(item.get("request_id")) == str(request_id):
                 item["nl_answer"] = answer
-                return
-        if session.chat_history:
-            session.chat_history[-1]["nl_answer"] = answer
+                break
+        else:
+            if session.chat_history:
+                session.chat_history[-1]["nl_answer"] = answer
+        # Also backfill nl_answer into the matching ConversationTurn so follow-up
+        # queries receive the previous answer in their prompt context.
+        if session.conversation_turns:
+            session.conversation_turns[-1].nl_answer = answer
 
 
 def _schedule_nl_background(session: Session, request_id: str, question: str, results: Optional[List[Any]]) -> None:

@@ -74,6 +74,7 @@ def delete_user(username: str) -> None:
 class ConversationTurn:
     question:  str
     sql:       Optional[str] = None
+    nl_answer: Optional[str] = None
     topic:     str           = "unknown"
     columns:   List[str]     = field(default_factory=list)
     row_count: int           = 0
@@ -83,7 +84,7 @@ class ConversationTurn:
 
 def serialize_conversation_turns(turns: List[ConversationTurn], max_turns: int = 3) -> str:
     """Compact context string passed into LLM prompt.
-    SQL snippet included so the model can craft correct follow-up queries.
+    Includes previous Q, answer, and SQL so the model has full context for follow-ups.
     """
     if not turns:
         return "No prior conversation."
@@ -93,9 +94,13 @@ def serialize_conversation_turns(turns: List[ConversationTurn], max_turns: int =
         if t.sql:
             snippet = t.sql[:500]
             sql_line = f"\nSQL: {snippet}{'...' if len(t.sql) > 500 else ''}"
+        answer_line = ""
+        if t.nl_answer:
+            snippet = t.nl_answer[:300]
+            answer_line = f"\nAnswer: {snippet}{'...' if len(t.nl_answer) > 300 else ''}"
         cols = ", ".join(t.columns[:8]) or "N/A"
         parts.append(
-            f"Topic: {t.topic}\nQ: {t.question}{sql_line}\n"
+            f"Topic: {t.topic}\nQ: {t.question}{sql_line}{answer_line}\n"
             f"Columns: {cols}\nRows: {t.row_count} | Status: {t.status}"
         )
     return "\n---\n".join(parts)

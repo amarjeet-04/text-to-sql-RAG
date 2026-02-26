@@ -3,14 +3,16 @@ rag_pipeline_trace.py
 ─────────────────────
 Step-by-step trace of the Text-to-SQL RAG pipeline with AUTO routing.
 
-The script reads your question, classifies its complexity using the same
-_estimate_query_complexity() function the production server uses, then
-automatically picks the right model + prompt — no --mode flag needed.
+Covers only the RAG pipeline steps (Steps 0–5):
+  Step 0 — Auto-routing (classify question → pick model + prompt)
+  Step 1 — Vector store bootstrap (FAISS + HuggingFace embeddings)
+  Step 2 — Query embedding + schema retrieval
+  Step 3 — Prompt construction
+  Step 4 — LLM call
+  Step 5 — SQL extraction + validation
 
-Routing table
-  deterministic  →  no LLM at all  (hard-coded SQL builders)    ~0 ms
-  simple_llm     →  gpt-4o-mini  + short direct-answer prompt   ~2–4 s
-  complex_llm    →  gpt-4o       + full chain-of-thought prompt  ~8–10 s
+Each step is timestamped. The generated SQL query is printed at the end.
+DB execution and result formatting are intentionally excluded.
 
 Usage
   python rag_pipeline_trace.py
@@ -38,7 +40,7 @@ load_dotenv()
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
-# ── colours ─────────────────────────────────────────────────────────────────
+# ── colours ──────────────────────────────────────────────────────────────────
 BOLD    = "\033[1m"
 CYAN    = "\033[96m"
 GREEN   = "\033[92m"
@@ -49,7 +51,7 @@ BLUE    = "\033[94m"
 DIM     = "\033[2m"
 RESET   = "\033[0m"
 
-# ── routing config per complexity tier ──────────────────────────────────────
+# ── routing config per complexity tier ───────────────────────────────────────
 ROUTING: Dict[str, Dict] = {
     "deterministic": {
         "model":       None,
@@ -74,8 +76,7 @@ ROUTING: Dict[str, Dict] = {
     },
 }
 
-# ── direct (short) prompt ────────────────────────────────────────────────────
-# Static sections (schema, rules, examples) first → maximises OpenAI prefix cache.
+# ── direct (short) prompt ─────────────────────────────────────────────────────
 DIRECT_SQL_TEMPLATE = """\
 You are a Text-to-SQL expert. Output ONLY a single SQL query inside a ```sql``` block. No explanation.
 
@@ -111,7 +112,7 @@ QUESTION: {question}
 ```sql"""
 
 
-# ── print helpers ────────────────────────────────────────────────────────────
+# ── print helpers ─────────────────────────────────────────────────────────────
 
 def _ts() -> str:
     return datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -160,7 +161,7 @@ def _preview(text: str, max_lines: int = 6) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# STEP 0 — Auto-routing: classify question → choose model + prompt
+# STEP 0 — Auto-routing
 # ═══════════════════════════════════════════════════════════════════════════
 
 def step0_route(question: str) -> Dict:
@@ -172,7 +173,6 @@ def step0_route(question: str) -> Dict:
 
     _info("Input question", question)
 
-    # ── show the rules the classifier uses ──────────────────────────────────
     _section("Routing rules (from _estimate_query_complexity)")
     _info("deterministic", "business overview phrases  OR  top-N pattern (e.g. 'top 10 X by Y')")
     _info("complex_llm  ", "contains: growth/yoy/ytd/pytd/trend/compared/versus/increase/decrease/change/previous year")
@@ -180,12 +180,10 @@ def step0_route(question: str) -> Dict:
     _info("             ", "OR question word count > 12")
     _info("simple_llm   ", "everything else — single dimension, single metric, short question")
 
-    # ── pre-check deterministic triggers so we can explain them ─────────────
     q = question.lower()
     words_list = q.split()
     words_set  = set(re.findall(r"[a-z_]+", q))
 
-    # mirrors logic inside _estimate_query_complexity
     OVERVIEW_PHRASES = {"business overview", "executive summary", "performance summary",
                         "how is business", "how does my business"}
     TOPN_PATTERN     = re.compile(r"\b(top|bottom)\s+\d+\b", re.I)
@@ -197,7 +195,6 @@ def step0_route(question: str) -> Dict:
     is_topn          = bool(TOPN_PATTERN.search(question))
     is_overview      = any(ph in q for ph in OVERVIEW_PHRASES)
 
-    # ── classify ────────────────────────────────────────────────────────────
     _section("Classifying …")
     complexity = _estimate_query_complexity(question)
     route_cfg  = ROUTING[complexity]
@@ -206,7 +203,7 @@ def step0_route(question: str) -> Dict:
     _section("Evidence for this classification")
     _info("Word count",            len(words_list))
     _info("Top-N pattern match",   f"YES — '{TOPN_PATTERN.search(question).group()}'" if is_topn else "no")
-    _info("Overview phrase match", f"YES" if is_overview else "no")
+    _info("Overview phrase match", "YES" if is_overview else "no")
     if matched_complex:
         _info("Complex keywords found", ", ".join(sorted(matched_complex)))
     else:
@@ -216,7 +213,6 @@ def step0_route(question: str) -> Dict:
     else:
         _info("Dimension words found",  "none")
 
-    # explain which rule fired
     _section("Rule that triggered this tier")
     if complexity == "deterministic":
         if is_overview:
@@ -244,7 +240,7 @@ def step0_route(question: str) -> Dict:
     _route("→ Expected time", route_cfg["expected_ms"], color=color)
     _route("→ Reason",        route_cfg["description"], color=color)
 
-    elapsed = (time.perf_counter()-t0)*1000
+    elapsed = (time.perf_counter() - t0) * 1000
     _ok("STEP 0 COMPLETE — routing decided", elapsed_ms=elapsed)
     return {"complexity": complexity, "route": route_cfg, "step_ms": elapsed}
 
@@ -259,14 +255,14 @@ def step1_build_vector_store() -> "RAGEngine":
 
     _info("Loading RAGEngine …")
     from app.rag.rag_engine import RAGEngine
-    _ok("RAGEngine imported", elapsed_ms=(time.perf_counter()-t0)*1000)
+    _ok("RAGEngine imported", elapsed_ms=(time.perf_counter() - t0) * 1000)
 
     _section("Initialising embedder")
     t1 = time.perf_counter()
     engine = RAGEngine(model_name="sentence-transformers/all-MiniLM-L6-v2", enable_embeddings=True)
     embedder_ok = engine.embedder is not None
     _ok("Embedder ready" if embedder_ok else "Embedder unavailable (keyword fallback)",
-        elapsed_ms=(time.perf_counter()-t1)*1000)
+        elapsed_ms=(time.perf_counter() - t1) * 1000)
     if embedder_ok:
         _info("Embedding model", engine.model_name)
 
@@ -274,7 +270,7 @@ def step1_build_vector_store() -> "RAGEngine":
     t2 = time.perf_counter()
     engine.load_default_schema()
     _ok("Schema docs loaded", f"{len(engine.documents)} documents",
-        elapsed_ms=(time.perf_counter()-t2)*1000)
+        elapsed_ms=(time.perf_counter() - t2) * 1000)
     _ok("FAISS index built" if engine.vector_store else "FAISS index NOT built (keyword fallback)")
 
     _section("Document breakdown")
@@ -285,7 +281,7 @@ def step1_build_vector_store() -> "RAGEngine":
         _info(f"  doc_type={dtype}", f"{n} docs")
     _info("Cache TTL", f"{engine.CACHE_TTL}s  (max {engine.CACHE_MAX} entries)")
 
-    elapsed = (time.perf_counter()-t0)*1000
+    elapsed = (time.perf_counter() - t0) * 1000
     _ok("STEP 1 COMPLETE — vector store ready", elapsed_ms=elapsed)
     return engine, elapsed
 
@@ -304,7 +300,7 @@ def step2_embed_and_retrieve(engine: "RAGEngine", question: str) -> Dict:
     if engine.embedder:
         import numpy as np
         vec = np.array(engine.embedder.embed_query(question), dtype="float32")
-        _ok("Query embedded", f"dim={len(vec)}", elapsed_ms=(time.perf_counter()-t1)*1000)
+        _ok("Query embedded", f"dim={len(vec)}", elapsed_ms=(time.perf_counter() - t1) * 1000)
         _info("First 8 dims", "  ".join(f"{v:+.4f}" for v in vec[:8]))
     else:
         _info("No embedder — keyword fallback")
@@ -318,7 +314,7 @@ def step2_embed_and_retrieve(engine: "RAGEngine", question: str) -> Dict:
     _section("FAISS similarity search")
     t2 = time.perf_counter()
     rag_context = engine.retrieve(query=question, top_k=4, fast_mode=False, skip_for_followup=False)
-    _ok("Retrieval complete", elapsed_ms=(time.perf_counter()-t2)*1000)
+    _ok("Retrieval complete", elapsed_ms=(time.perf_counter() - t2) * 1000)
 
     examples = rag_context.get("examples", [])
     rules    = rag_context.get("rules",    [])
@@ -331,13 +327,13 @@ def step2_embed_and_retrieve(engine: "RAGEngine", question: str) -> Dict:
         _info(f"  rule[{i}]", r.get("name", r.get("content", "")[:60]))
     _info("Retrieved tables", len(tables))
 
-    elapsed = (time.perf_counter()-t0)*1000
+    elapsed = (time.perf_counter() - t0) * 1000
     _ok("STEP 2 COMPLETE — context retrieved from FAISS", elapsed_ms=elapsed)
     return rag_context, elapsed
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# STEP 3 — Prompt construction (template chosen by router)
+# STEP 3 — Prompt construction
 # ═══════════════════════════════════════════════════════════════════════════
 
 def step3_build_prompt(question: str, rag_context: Dict, route_cfg: Dict) -> Dict:
@@ -353,7 +349,6 @@ def step3_build_prompt(question: str, rag_context: Dict, route_cfg: Dict) -> Dic
         DEFAULT_SQL_DIALECT,
     )
 
-    # ── show which template was chosen and why ───────────────────────────────
     _section("Template selected by router")
     color = route_cfg["color"]
     if route_cfg["prompt"] is None:
@@ -366,7 +361,6 @@ def step3_build_prompt(question: str, rag_context: Dict, route_cfg: Dict) -> Dic
         _route("Template", "CHAIN-OF-THOUGHT  — 6-step reasoning required for this complexity", color=color)
         _route("Output tokens", "~1500–2000  (LLM must reason through date math + multi-join logic)", color=color)
 
-    # ── few-shot examples ───────────────────────────────────────────────────
     _section("Building few-shot block from retrieved examples")
     examples = rag_context.get("examples", [])
     few_shot_str = ""
@@ -381,14 +375,12 @@ def step3_build_prompt(question: str, rag_context: Dict, route_cfg: Dict) -> Dic
     else:
         _info("No few-shot examples retrieved")
 
-    # ── RAG table hints ─────────────────────────────────────────────────────
     _section("RAG table hints")
     raw_tables = rag_context.get("tables", []) or []
     rag_hints  = [t["table"] if isinstance(t, dict) else str(t) for t in raw_tables if t]
     retrieved_tables_hint = ", ".join(rag_hints[:6]) if rag_hints else "none"
     _info("Table hints", retrieved_tables_hint)
 
-    # ── schema (abbreviated for trace) ──────────────────────────────────────
     _section("Schema text")
     schema_text = (
         "-- NOTE: abbreviated for trace — production uses full INFORMATION_SCHEMA dump.\n"
@@ -402,7 +394,6 @@ def step3_build_prompt(question: str, rag_context: Dict, route_cfg: Dict) -> Dic
     _info("Schema chars", len(schema_text))
     _preview(schema_text)
 
-    # ── business rules ───────────────────────────────────────────────────────
     _section("Business rules")
     rules = rag_context.get("rules", [])
     stored_guidance = "\n".join(r.get("content", r.get("name", "")) for r in rules) if rules else (
@@ -413,7 +404,6 @@ def step3_build_prompt(question: str, rag_context: Dict, route_cfg: Dict) -> Dic
     _info("Rules chars", len(stored_guidance))
     _preview(stored_guidance)
 
-    # ── date + dialect ───────────────────────────────────────────────────────
     _section("Date reference + dialect")
     dialect    = DEFAULT_SQL_DIALECT
     date_ref   = _build_relative_date_reference()
@@ -422,7 +412,6 @@ def step3_build_prompt(question: str, rag_context: Dict, route_cfg: Dict) -> Dic
     _info("TODAY (IST)", date_ref)
     _info("Conversation context", "(no prior conversation)")
 
-    # ── assemble ─────────────────────────────────────────────────────────────
     _section("Assembling final prompt")
     prompt_vars = dict(
         dialect_label             = dial_label,
@@ -442,26 +431,25 @@ def step3_build_prompt(question: str, rag_context: Dict, route_cfg: Dict) -> Dic
 
     _info("Template", template_name)
     _ok("Prompt assembled", f"{len(final_prompt)} chars  (~{len(final_prompt)//4} input tokens)",
-        elapsed_ms=(time.perf_counter()-t0)*1000)
+        elapsed_ms=(time.perf_counter() - t0) * 1000)
 
     _section("Prompt preview (first 30 lines)")
     _preview(final_prompt, max_lines=30)
 
-    elapsed = (time.perf_counter()-t0)*1000
+    elapsed = (time.perf_counter() - t0) * 1000
     return {"prompt_vars": prompt_vars, "final_prompt_text": final_prompt,
             "template": template, "use_direct": use_direct, "step_ms": elapsed}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# STEP 4 — LLM interaction
+# STEP 4 — LLM call
 # ═══════════════════════════════════════════════════════════════════════════
 
 def step4_call_llm(prompt_vars: Dict, route_cfg: Dict, template: str,
                    complexity: str) -> str:
-    _banner(4, "LLM INTERACTION")
+    _banner(4, "LLM CALL")
     t0 = time.perf_counter()
 
-    # ── deterministic short-circuit ─────────────────────────────────────────
     if complexity == "deterministic":
         _route("Deterministic path — no LLM call needed for this question",
                color=route_cfg["color"])
@@ -496,11 +484,12 @@ def step4_call_llm(prompt_vars: Dict, route_cfg: Dict, template: str,
             "GROUP BY SM.SupplierName\nORDER BY [Total Bookings] DESC"
         )
         raw = f"```sql\n{mock_sql}\n```"
-        elapsed = (time.perf_counter()-t0)*1000
+        elapsed = (time.perf_counter() - t0) * 1000
         _ok("Mock LLM response generated", elapsed_ms=elapsed)
         _preview(raw, max_lines=20)
         return raw, elapsed
 
+    raw_response = ""
     try:
         from langchain_openai import ChatOpenAI
         from langchain_core.prompts import ChatPromptTemplate
@@ -510,16 +499,15 @@ def step4_call_llm(prompt_vars: Dict, route_cfg: Dict, template: str,
         llm   = ChatOpenAI(model=llm_model, temperature=0,
                            request_timeout=timeout_s, openai_api_key=api_key)
         chain = ChatPromptTemplate.from_template(template) | llm | StrOutputParser()
-        _ok("Chain constructed", elapsed_ms=(time.perf_counter()-t0)*1000)
+        _ok("Chain constructed", elapsed_ms=(time.perf_counter() - t0) * 1000)
 
         _section("Invoking LLM …")
         t1 = time.perf_counter()
         raw_response = chain.invoke(prompt_vars)
-        llm_ms = (time.perf_counter()-t1)*1000
+        llm_ms = (time.perf_counter() - t1) * 1000
 
         _ok("LLM responded", f"{len(raw_response)} chars", elapsed_ms=llm_ms)
 
-        # show how many output tokens were used vs the other path
         est_out = len(raw_response) // 4
         if route_cfg["prompt"] == "direct":
             _route(f"Output tokens used: ~{est_out}  (chain-of-thought would have been ~1500–2000)",
@@ -533,9 +521,8 @@ def step4_call_llm(prompt_vars: Dict, route_cfg: Dict, template: str,
 
     except Exception as exc:
         _err("LLM call failed", exc)
-        raw_response = ""
 
-    elapsed = (time.perf_counter()-t0)*1000
+    elapsed = (time.perf_counter() - t0) * 1000
     _ok("STEP 4 COMPLETE", elapsed_ms=elapsed)
     return raw_response, elapsed
 
@@ -549,25 +536,28 @@ def step5_extract_sql(raw_response: str, complexity: str) -> str:
     t0 = time.perf_counter()
 
     if complexity == "deterministic":
-        _info("Deterministic path — SQL will be built in Step 6 (no LLM SQL to extract here)")
-        _ok("STEP 5 SKIPPED — deterministic SQL built at execution time", elapsed_ms=0)
-        return "(deterministic — sql built in step6)", 0.0
+        _info("Deterministic path — SQL built by hard-coded builder, no LLM SQL to extract")
+        _ok("STEP 5 SKIPPED — deterministic SQL built at query time", elapsed_ms=0)
+        return "(deterministic — sql built at query time)", 0.0
 
     from backend.services.sql_engine import _clean_sql_response, validate_sql, BLOCKED_KEYWORDS
 
     _section("Cleaning raw LLM response")
     t1 = time.perf_counter()
     cleaned_sql = _clean_sql_response(raw_response)
-    _ok("SQL extracted from markdown fence", elapsed_ms=(time.perf_counter()-t1)*1000)
+    _ok("SQL extracted from markdown fence", elapsed_ms=(time.perf_counter() - t1) * 1000)
 
     _section("Extracted SQL")
-    _preview(cleaned_sql, max_lines=25) if cleaned_sql else _info("Empty SQL — extraction returned nothing")
+    if cleaned_sql:
+        _preview(cleaned_sql, max_lines=25)
+    else:
+        _info("Empty SQL — extraction returned nothing")
 
     _section("Validating SQL")
     t2 = time.perf_counter()
     is_valid, err_msg = validate_sql(cleaned_sql)
     if is_valid:
-        _ok("SQL passed validation", elapsed_ms=(time.perf_counter()-t2)*1000)
+        _ok("SQL passed validation", elapsed_ms=(time.perf_counter() - t2) * 1000)
     else:
         _err(f"SQL failed validation: {err_msg}", Exception(err_msg))
 
@@ -578,223 +568,9 @@ def step5_extract_sql(raw_response: str, complexity: str) -> str:
     else:
         _ok("No blocked keywords (DROP/DELETE/INSERT/UPDATE/…)")
 
-    elapsed = (time.perf_counter()-t0)*1000
+    elapsed = (time.perf_counter() - t0) * 1000
     _ok("STEP 5 COMPLETE — final SQL ready", elapsed_ms=elapsed)
-
-    print(f"\n{BOLD}{GREEN}{'═'*64}{RESET}")
-    print(f"{BOLD}{GREEN}  FINAL SQL QUERY{RESET}")
-    print(f"{BOLD}{GREEN}{'═'*64}{RESET}")
-    print(f"{BOLD}{cleaned_sql}{RESET}")
-    print(f"{BOLD}{GREEN}{'═'*64}{RESET}\n")
     return cleaned_sql, elapsed
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# STEP 6 — DB execution
-# ═══════════════════════════════════════════════════════════════════════════
-
-def step6_db_execution(sql: str, complexity: str, question: str = "") -> Dict:
-    """Connect to the real DB and execute the SQL, measuring wall-clock time.
-
-    For the deterministic tier, builds the SQL via _deterministic_timeout_fallback_sql()
-    before executing — so all three tiers always hit the DB.
-    """
-    _banner(6, "DATABASE EXECUTION")
-    t0 = time.perf_counter()
-
-    result: Dict = {
-        "rows": [],
-        "columns": [],
-        "row_count": 0,
-        "error": None,
-        "skipped": False,
-        "exec_ms": 0.0,
-        "sql_used": sql,
-    }
-
-    # ── build DB connection from .env ────────────────────────────────────────
-    _section("Reading DB config from .env")
-    host     = os.getenv("DB_HOST", "")
-    port     = os.getenv("DB_PORT", "1433")
-    user     = os.getenv("DB_USER", "")
-    password = os.getenv("DB_PASSWORD", "")
-    database = os.getenv("DB_NAME", "")
-
-    if not host or not user:
-        _info("DB_HOST / DB_USER not set in .env — skipping real execution")
-        result["skipped"] = True
-        _ok("STEP 6 SKIPPED — no DB config", elapsed_ms=0)
-        return result
-
-    _info("Host",     f"{host}:{port}")
-    _info("Database", database)
-    _info("User",     user)
-
-    try:
-        from urllib.parse import quote_plus
-        from sqlalchemy import create_engine, text as sa_text
-        import pandas as pd
-
-        _section("Connecting to database (lightweight engine)")
-        t_conn = time.perf_counter()
-        odbc_params = (
-            f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-            f"SERVER={host},{port};"
-            f"DATABASE={database};"
-            f"UID={user};"
-            f"PWD={password};"
-            f"LoginTimeout=10;"
-            f"QueryTimeout=30;"
-            f"TrustServerCertificate=yes;"
-        )
-        conn_uri = f"mssql+pyodbc:///?odbc_connect={quote_plus(odbc_params)}"
-        sa_engine = create_engine(conn_uri, pool_pre_ping=False)
-
-        with sa_engine.connect() as conn:
-            conn.execute(sa_text("SELECT 1"))
-        conn_ms = (time.perf_counter() - t_conn) * 1000
-        _ok("Connected", f"{host}:{port}/{database}", elapsed_ms=conn_ms)
-
-        # ── deterministic: build SQL now that we have a live connection ───────
-        if complexity == "deterministic":
-            _section("Building deterministic SQL (using live DB connection)")
-            from backend.services.sql_engine import _deterministic_timeout_fallback_sql
-            from app.db_utils import DatabaseConfig, create_database_with_views
-            try:
-                cfg = DatabaseConfig(
-                    host=host, port=port,
-                    username=user, password=password,
-                    database=database,
-                    include_tables=os.getenv("SCHEMA_TABLES", "").split(",") or None,
-                )
-                db_obj = create_database_with_views(cfg)
-                det_sql, det_kind = _deterministic_timeout_fallback_sql(question, db_obj)
-            except Exception as e:
-                _info(f"create_database_with_views failed ({e}) — trying without db_obj")
-                det_sql, det_kind = _deterministic_timeout_fallback_sql(question, None)
-
-            if det_sql:
-                _ok(f"Deterministic SQL built", f"kind={det_kind}")
-                _preview(det_sql, max_lines=20)
-                sql = det_sql
-                result["sql_used"] = sql
-            else:
-                _info("No deterministic SQL returned for this question — skipping execution")
-                result["skipped"] = True
-                _ok("STEP 6 SKIPPED — deterministic builder returned nothing", elapsed_ms=0)
-                return result
-
-        # ── guard: still no valid SQL ─────────────────────────────────────────
-        if not sql or sql.startswith("("):
-            _info("No valid SQL available — skipping DB execution")
-            result["skipped"] = True
-            _ok("STEP 6 SKIPPED — no SQL", elapsed_ms=0)
-            return result
-
-        # ── execute ───────────────────────────────────────────────────────────
-        _section("Executing SQL")
-        _preview(sql, max_lines=20)
-        t_exec = time.perf_counter()
-        with sa_engine.connect() as conn:
-            df = pd.read_sql(sa_text(sql), conn)
-        exec_ms = (time.perf_counter() - t_exec) * 1000
-        result["exec_ms"] = exec_ms
-
-        if len(df) > 500:
-            df = df.iloc[:500]
-
-        if len(df) == 0:
-            _info("Query returned 0 rows")
-            result["row_count"] = 0
-        else:
-            result["rows"]      = df.to_dict(orient="records")
-            result["columns"]   = list(df.columns)
-            result["row_count"] = len(df)
-            _ok(f"Query executed successfully — {len(df)} row(s) returned", elapsed_ms=exec_ms)
-            _info("Columns", ", ".join(df.columns.tolist()))
-
-    except Exception as exc:
-        err_str = str(exc)
-        if "10060" in err_str or "08S01" in err_str or "TCP Provider" in err_str:
-            _err("DB not reachable from this machine (TCP timeout)", Exception(
-                "The database is likely only accessible from the production server. "
-                "Run rag_pipeline_trace.py on the server, or use a VPN/SSH tunnel."))
-        else:
-            _err("DB connection / execution error", exc)
-        result["error"] = err_str
-
-    _ok("STEP 6 COMPLETE", elapsed_ms=(time.perf_counter() - t0) * 1000)
-    return result
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# STEP 7 — Result formatting
-# ═══════════════════════════════════════════════════════════════════════════
-
-def step7_result_formatting(db_result: Dict) -> Dict:
-    """Format raw DB rows into display-ready records with timing."""
-    _banner(7, "RESULT FORMATTING")
-    t0 = time.perf_counter()
-
-    formatted: Dict = {
-        "records": [],
-        "row_count": 0,
-        "columns": [],
-        "format_ms": 0.0,
-    }
-
-    if db_result.get("skipped") or db_result.get("error"):
-        reason = "DB step was skipped" if db_result.get("skipped") else f"DB error: {db_result.get('error')}"
-        _info(f"Nothing to format — {reason}")
-        _ok("STEP 7 SKIPPED", elapsed_ms=0)
-        return formatted
-
-    rows    = db_result.get("rows", [])
-    columns = db_result.get("columns", [])
-
-    if not rows:
-        _info("0 rows returned — nothing to format")
-        _ok("STEP 7 COMPLETE — empty result set", elapsed_ms=(time.perf_counter() - t0) * 1000)
-        return formatted
-
-    # ── formatting ───────────────────────────────────────────────────────────
-    _section("Rounding numeric values (2 decimal places)")
-    t_fmt = time.perf_counter()
-
-    records = []
-    for row in rows:
-        clean = {}
-        for k, v in row.items():
-            if isinstance(v, float):
-                clean[k] = round(v, 2)
-            else:
-                clean[k] = v
-        records.append(clean)
-
-    fmt_ms = (time.perf_counter() - t_fmt) * 1000
-    formatted["records"]   = records
-    formatted["row_count"] = len(records)
-    formatted["columns"]   = columns
-    formatted["format_ms"] = fmt_ms
-
-    _ok(f"Formatted {len(records)} record(s)", elapsed_ms=fmt_ms)
-
-    # ── print table ──────────────────────────────────────────────────────────
-    _section("Result preview (first 10 rows)")
-    col_widths = {c: max(len(str(c)), max((len(str(r.get(c, ""))) for r in records[:20]), default=0))
-                  for c in columns}
-    header = "  " + "  ".join(str(c).ljust(col_widths[c]) for c in columns)
-    sep    = "  " + "  ".join("─" * col_widths[c] for c in columns)
-    print(f"    {DIM}{header}{RESET}")
-    print(f"    {DIM}{sep}{RESET}")
-    for row in records[:10]:
-        line = "  " + "  ".join(str(row.get(c, "")).ljust(col_widths[c]) for c in columns)
-        print(f"    {line}")
-    if len(records) > 10:
-        print(f"    {DIM}  … {len(records) - 10} more rows{RESET}")
-
-    _ok("STEP 7 COMPLETE — results ready for frontend", elapsed_ms=(time.perf_counter() - t0) * 1000)
-    return formatted
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -803,7 +579,7 @@ def step7_result_formatting(db_result: Dict) -> Dict:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Trace the Text-to-SQL RAG pipeline with automatic complexity routing.",
+        description="Trace the Text-to-SQL RAG pipeline (Steps 0–5, no DB execution).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
@@ -822,7 +598,7 @@ def main():
     question = args.question.strip()
 
     print(f"\n{BOLD}{'═'*64}{RESET}")
-    print(f"{BOLD}  TEXT-TO-SQL RAG PIPELINE — AUTO-ROUTED TRACE{RESET}")
+    print(f"{BOLD}  TEXT-TO-SQL RAG PIPELINE TRACE  (Steps 0–5){RESET}")
     print(f"{BOLD}{'═'*64}{RESET}")
     print(f"  Question : {BOLD}{question}{RESET}")
     print(f"  Started  : {_ts()}")
@@ -843,14 +619,21 @@ def main():
     raw_resp,    ms4 = step4_call_llm(prompt_res["prompt_vars"], route_cfg,
                                       prompt_res["template"], complexity)
     final_sql,   ms5 = step5_extract_sql(raw_resp, complexity)
-    db_result        = step6_db_execution(final_sql, complexity, question=question)
-    ms6              = db_result.get("exec_ms", 0)
-    fmt_result       = step7_result_formatting(db_result)
-    ms7              = fmt_result.get("format_ms", 0)
 
     total_ms = (time.perf_counter() - t_pipeline) * 1000
 
-    # ── timing breakdown ─────────────────────────────────────────────────────
+    # ── generated SQL ─────────────────────────────────────────────────────────
+    print(f"\n{BOLD}{GREEN}{'═'*64}{RESET}")
+    print(f"{BOLD}{GREEN}  GENERATED SQL QUERY{RESET}")
+    print(f"{BOLD}{GREEN}{'═'*64}{RESET}")
+    if final_sql and not final_sql.startswith("("):
+        for line in final_sql.strip().splitlines():
+            print(f"  {BOLD}{line}{RESET}")
+    else:
+        print(f"  {DIM}{final_sql}{RESET}")
+    print(f"{BOLD}{GREEN}{'═'*64}{RESET}")
+
+    # ── pipeline summary ──────────────────────────────────────────────────────
     model_used = route_cfg["model"] or os.getenv("LLM_MODEL", "gpt-4o")
     print(f"\n{BOLD}{CYAN}{'═'*64}{RESET}")
     print(f"{BOLD}{CYAN}  PIPELINE SUMMARY{RESET}")
@@ -861,55 +644,22 @@ def main():
     print(f"  Prompt type     : {'direct (SQL-only)' if route_cfg['prompt'] == 'direct' else 'chain-of-thought (6 steps)' if route_cfg['prompt'] == 'cot' else 'none (deterministic)'}")
     print(f"  Docs in index   : {len(engine.documents)}")
     print(f"  Examples found  : {len(rag_context.get('examples', []))}")
-    print(f"  Rules found     : {len(rag_context.get('rules',    []))}")
+    print(f"  Rules found     : {len(rag_context.get('rules', []))}")
     print(f"  Prompt chars    : {len(prompt_res['final_prompt_text'])}")
-    print(f"  SQL lines       : {len(final_sql.splitlines())}")
-    print(f"  Rows returned   : {fmt_result['row_count']}")
+    print(f"  SQL lines       : {len(final_sql.splitlines()) if not final_sql.startswith('(') else 'N/A (deterministic)'}")
     print(f"{BOLD}{CYAN}{'─'*64}{RESET}")
     print(f"{BOLD}{CYAN}  STAGE TIMINGS{RESET}")
     print(f"{BOLD}{CYAN}{'─'*64}{RESET}")
-    print(f"  Step 0  auto-routing      :  {ms0:.0f} ms")
-    print(f"  Step 1  vector store boot :  {ms1:.0f} ms")
-    print(f"  Step 2  RAG retrieval     :  {ms2:.0f} ms")
-    print(f"  Step 3  prompt assembly   :  {ms3:.0f} ms")
-    print(f"  Step 4  LLM call          :  {ms4:.0f} ms")
-    print(f"  Step 5  SQL extraction    :  {ms5:.0f} ms")
-    print(f"  Step 6  DB execution      :  {ms6:.0f} ms")
-    print(f"  Step 7  result formatting :  {ms7:.1f} ms")
+    print(f"  Step 0  auto-routing      :  {ms0:>8.0f} ms")
+    print(f"  Step 1  vector store boot :  {ms1:>8.0f} ms")
+    print(f"  Step 2  RAG retrieval     :  {ms2:>8.0f} ms")
+    print(f"  Step 3  prompt assembly   :  {ms3:>8.0f} ms")
+    print(f"  Step 4  LLM call          :  {ms4:>8.0f} ms")
+    print(f"  Step 5  SQL extraction    :  {ms5:>8.0f} ms")
     print(f"{BOLD}{CYAN}{'─'*64}{RESET}")
-    print(f"  {BOLD}Total wall time   :  {total_ms:.0f} ms{RESET}")
-    print(f"  Expected (live)   :  {route_cfg['expected_ms']}")
-    if db_result.get("error") and "10060" not in db_result["error"] and "08S01" not in db_result["error"]:
-        print(f"  {RED}DB error          :  {db_result['error'][:80]}{RESET}")
+    print(f"  {BOLD}Total wall time           :  {total_ms:>8.0f} ms{RESET}")
+    print(f"  Expected (live)           :  {route_cfg['expected_ms']}")
     print(f"{BOLD}{CYAN}{'═'*64}{RESET}\n")
-
-    # ── query results ─────────────────────────────────────────────────────────
-    records = fmt_result.get("records", [])
-    columns = fmt_result.get("columns", [])
-    if records and columns:
-        print(f"{BOLD}{GREEN}{'═'*64}{RESET}")
-        print(f"{BOLD}{GREEN}  QUERY RESULTS  ({len(records)} row{'s' if len(records) != 1 else ''}){RESET}")
-        print(f"{BOLD}{GREEN}{'═'*64}{RESET}")
-        col_widths = {
-            c: max(len(str(c)), max(len(str(r.get(c, ""))) for r in records))
-            for c in columns
-        }
-        header = "  ".join(str(c).ljust(col_widths[c]) for c in columns)
-        sep    = "  ".join("─" * col_widths[c] for c in columns)
-        print(f"  {BOLD}{header}{RESET}")
-        print(f"  {DIM}{sep}{RESET}")
-        for row in records:
-            line = "  ".join(str(row.get(c, "")).ljust(col_widths[c]) for c in columns)
-            print(f"  {line}")
-        if len(records) > 500:
-            print(f"  {DIM}  … (capped at 500 rows){RESET}")
-        print(f"{BOLD}{GREEN}{'═'*64}{RESET}\n")
-    elif db_result.get("skipped"):
-        print(f"{BOLD}{BLUE}  [No DB results — deterministic or no DB config]{RESET}\n")
-    elif db_result.get("error"):
-        print(f"{BOLD}{RED}  [DB error — see above]{RESET}\n")
-    else:
-        print(f"{BOLD}{YELLOW}  [Query returned 0 rows]{RESET}\n")
 
 
 if __name__ == "__main__":

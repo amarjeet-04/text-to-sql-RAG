@@ -6,7 +6,7 @@ import signal
 import os
 import time
 import logging
-from typing import Optional, List, Tuple, Any
+from typing import Optional, List, Tuple, Any, Dict
 from functools import wraps
 from dataclasses import dataclass
 from contextlib import contextmanager
