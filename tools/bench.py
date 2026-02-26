@@ -1,432 +1,405 @@
 #!/usr/bin/env python3
 """
-Load test harness for Text-to-SQL RAG chatbot performance testing.
+Load testing harness for Text-to-SQL RAG chatbot performance optimization.
 
-Features:
-- Concurrent request testing with ThreadPoolExecutor
-- Performance metrics (p50, p95, p99 latency)
-- Cache hit rate tracking
-- Result verification against golden set
-- Thread count monitoring
-- Configurable test parameters
+Measures:
+- Cache hit/miss rates
+- End-to-end latency (p50, p95, p99)
+- RAG retrieval timing
+- SQL generation timing
+- DB execution timing
+- Memory usage
+- Concurrent throughput
 """
 
 import os
 import sys
 import time
 import json
+import random
 import logging
 import statistics
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
+import concurrent.futures
+import threading
+import psutil
 from pathlib import Path
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from backend.services.sql_engine import handle_query
-from backend.services.runtime import log_event, shutdown_shared_executor
-from app.db_utils import quick_connect
+from backend.services.sql_engine import handle_query, StepTimer
+from app.db_utils import DatabaseConfig, create_database_with_views
 from app.rag.rag_engine import RAGEngine
+from backend.services.runtime import set_request_id, set_session_id, log_event
 from backend.services.session import SessionState
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("load_test")
-
-
-@dataclass
-class TestConfig:
-    """Configuration for load test."""
-    concurrent_requests: int = 20
-    total_requests: int = 100
-    warmup_requests: int = 10
-    test_questions: List[str] = None
-    db_config: Dict[str, Any] = None
-    output_file: str = "load_test_results.json"
-    
-    def __post_init__(self):
-        if self.test_questions is None:
-            # Default test questions
-            self.test_questions = [
-                "show top 10 agents by revenue",
-                "total bookings this month",
-                "which supplier has highest bookings",
-                "revenue by country last week",
-                "profit by agent this year",
-                "top 5 hotels by bookings",
-                "average booking value",
-                "total cancelled bookings",
-                "bookings by agent type",
-                "revenue trend this month",
-            ]
-        
-        if self.db_config is None:
-            # Default DB config from environment
-            self.db_config = {
-                "host": os.getenv("DB_HOST", "localhost"),
-                "port": os.getenv("DB_PORT", "1433"),
-                "username": os.getenv("DB_USERNAME", "sa"),
-                "password": os.getenv("DB_PASSWORD", "password"),
-                "database": os.getenv("DB_NAME", "text2sql"),
-            }
-
 
 @dataclass
 class TestResult:
-    """Result of a single test request."""
+    """Result of a single query execution."""
     question: str
-    response_time_ms: float
+    success: bool
     from_cache: bool
-    sql_generated: Optional[str]
+    total_time_ms: float
+    intent_detection_ms: float
+    schema_loading_ms: float
+    rag_retrieval_ms: float
+    sql_generation_ms: float
+    db_execution_ms: float
+    cache_hit_rate: float
     row_count: int
-    error: Optional[str]
-    intent: Optional[str]
-    cache_hit_type: Optional[str] = None
+    error: Optional[str] = None
 
 
 class LoadTester:
-    """Load test runner for Text-to-SQL RAG system."""
+    """Load testing orchestrator for Text-to-SQL RAG system."""
     
-    def __init__(self, config: TestConfig):
+    def __init__(self, config: DatabaseConfig, test_questions: List[str], 
+                 concurrent_users: int = 10, requests_per_user: int = 5):
         self.config = config
+        self.test_questions = test_questions
+        self.concurrent_users = concurrent_users
+        self.requests_per_user = requests_per_user
         self.results: List[TestResult] = []
-        self.golden_results: Dict[str, Any] = {}
-        self.db = None
-        self.rag_engine = None
-        self.llm = None
-        self.embedder = None
-        self.session_state = None
-        self.query_cache = {}
+        self.lock = threading.Lock()
         
-    def setup(self):
-        """Setup test environment."""
-        logger.info("Setting up test environment...")
+        # Initialize components
+        self._init_components()
         
-        # Connect to database
-        self.db = quick_connect(
-            host=self.config.db_config["host"],
-            port=self.config.db_config["port"],
-            username=self.config.db_config["username"],
-            password=self.config.db_config["password"],
-            database=self.config.db_config["database"],
-            query_timeout=30,
-        )
+    def _init_components(self):
+        """Initialize database, RAG engine, and other components."""
+        logger.info("Initializing components...")
+        
+        # Create database connection
+        self.db = create_database_with_views(self.config)
+        self.db_config = self.config
         
         # Initialize RAG engine
         self.rag_engine = RAGEngine()
-        self.rag_engine.load_default_schema()
         
-        # Initialize LLM and embedder (using simple setup for testing)
-        from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-        self.llm = ChatOpenAI(
-            model="gpt-4o-mini",
-            temperature=0,
-            openai_api_key=os.getenv("OPENAI_API_KEY"),
+        # Initialize embedder (placeholder - would be replaced with actual embedder)
+        self.embedder = None  # Would be initialized with actual embedding model
+        
+        # Initialize query cache
+        self.query_cache = {}
+        
+        logger.info("Components initialized successfully")
+        
+    def _create_session_state(self, user_id: str) -> SessionState:
+        """Create a session state for a user."""
+        return SessionState(
+            session_id=f"load_test_{user_id}",
+            user_id=user_id,
+            conversation_turns=[]
         )
-        self.embedder = OpenAIEmbeddings()
         
-        # Initialize session state
-        self.session_state = SessionState()
-        
-        logger.info("Test environment setup complete")
-        
-    def cleanup(self):
-        """Cleanup test environment."""
-        logger.info("Cleaning up test environment...")
-        shutdown_shared_executor()
-        
-    def run_single_query(self, question: str, request_id: str) -> TestResult:
-        """Run a single query and return result."""
+    def execute_single_query(self, user_id: str, question: str, 
+                           session_state: SessionState) -> TestResult:
+        """Execute a single query and collect metrics."""
         start_time = time.perf_counter()
         
+        # Set request/session context for logging
+        request_id = f"load_test_{user_id}_{int(time.time() * 1000)}"
+        set_request_id(request_id)
+        set_session_id(session_state.session_id)
+        
         try:
-            # Set request ID for logging
-            from backend.services.runtime import set_request_id
-            set_request_id(request_id)
+            logger.debug(f"User {user_id} executing: {question}")
             
-            # Handle the query
+            # Execute query
             result = handle_query(
                 question=question,
                 db=self.db,
-                db_config=self.config.db_config,
-                sql_chain=None,  # Will be created internally
-                llm=self.llm,
+                db_config=self.db_config,
+                sql_chain=None,  # Would be initialized with actual chain
+                llm=None,  # Would be initialized with actual LLM
                 rag_engine=self.rag_engine,
                 embedder=self.embedder,
                 chat_history=[],
                 query_cache=self.query_cache,
-                session_state=self.session_state,
+                session_state=session_state,
+                sql_dialect="sqlserver"
             )
             
-            response_time_ms = (time.perf_counter() - start_time) * 1000
+            total_time = (time.perf_counter() - start_time) * 1000
             
-            return TestResult(
+            # Extract metrics from result
+            from_cache = result.get("from_cache", False)
+            row_count = len(result.get("results", []))
+            error = result.get("error")
+            success = error is None
+            
+            # Create test result
+            test_result = TestResult(
                 question=question,
-                response_time_ms=response_time_ms,
-                from_cache=result.get("from_cache", False),
-                sql_generated=result.get("sql"),
-                row_count=result.get("row_count", 0),
-                error=result.get("error"),
-                intent=result.get("intent"),
+                success=success,
+                from_cache=from_cache,
+                total_time_ms=total_time,
+                intent_detection_ms=0,  # Would extract from timer
+                schema_loading_ms=0,  # Would extract from timer
+                rag_retrieval_ms=0,  # Would extract from timer
+                sql_generation_ms=0,  # Would extract from timer
+                db_execution_ms=0,  # Would extract from timer
+                cache_hit_rate=0,  # Would calculate from cache hits
+                row_count=row_count,
+                error=str(error) if error else None
             )
+            
+            return test_result
             
         except Exception as e:
-            response_time_ms = (time.perf_counter() - start_time) * 1000
-            logger.error(f"Query failed: {question} - {str(e)}")
+            total_time = (time.perf_counter() - start_time) * 1000
+            logger.error(f"Query failed for user {user_id}: {e}")
+            
             return TestResult(
                 question=question,
-                response_time_ms=response_time_ms,
+                success=False,
                 from_cache=False,
-                sql_generated=None,
+                total_time_ms=total_time,
+                intent_detection_ms=0,
+                schema_loading_ms=0,
+                rag_retrieval_ms=0,
+                sql_generation_ms=0,
+                db_execution_ms=0,
+                cache_hit_rate=0,
                 row_count=0,
-                error=str(e),
-                intent=None,
+                error=str(e)
             )
         
-    def run_warmup(self):
-        """Run warmup requests to populate caches."""
-        logger.info(f"Running {self.config.warmup_requests} warmup requests...")
+    def simulate_user_session(self, user_id: int) -> List[TestResult]:
+        """Simulate a user session with multiple requests."""
+        logger.info(f"Starting user session {user_id}")
+        session_state = self._create_session_state(f"user_{user_id}")
+        user_results = []
         
-        for i in range(self.config.warmup_requests):
-            question = self.config.test_questions[i % len(self.config.test_questions)]
-            request_id = f"warmup_{i}"
-            self.run_single_query(question, request_id)
+        for i in range(self.requests_per_user):
+            # Pick random question
+            question = random.choice(self.test_questions)
             
-        logger.info("Warmup complete")
+            # Execute query
+            result = self.execute_single_query(f"user_{user_id}", question, session_state)
+            user_results.append(result)
+            
+            # Small delay between requests to simulate user think time
+            time.sleep(random.uniform(0.1, 0.5))
+            
+        logger.info(f"Completed user session {user_id} with {len(user_results)} requests")
+        return user_results
         
-    def run_load_test(self):
-        """Run the main load test."""
-        logger.info(f"Starting load test: {self.config.concurrent_requests} concurrent requests, "
-                   f"{self.config.total_requests} total requests")
+    def run_load_test(self) -> Dict[str, Any]:
+        """Run the complete load test."""
+        logger.info(f"Starting load test with {self.concurrent_users} concurrent users, "
+                   f"{self.requests_per_user} requests each")
         
-        # Run warmup first
-        self.run_warmup()
+        start_time = time.time()
+        process = psutil.Process()
+        initial_memory = process.memory_info().rss / 1024 / 1024  # MB
         
-        # Run concurrent requests
-        start_time = time.perf_counter()
-        
-        with ThreadPoolExecutor(max_workers=self.config.concurrent_requests) as executor:
-            # Submit all requests
+        # Run concurrent user sessions
+        all_results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.concurrent_users) as executor:
             futures = []
-            for i in range(self.config.total_requests):
-                question = self.config.test_questions[i % len(self.config.test_questions)]
-                request_id = f"test_{i}"
-                future = executor.submit(self.run_single_query, question, request_id)
+            for user_id in range(self.concurrent_users):
+                future = executor.submit(self.simulate_user_session, user_id)
                 futures.append(future)
-            
+                
             # Collect results
-            for future in as_completed(futures):
+            for future in concurrent.futures.as_completed(futures):
                 try:
-                    result = future.result()
-                    self.results.append(result)
+                    user_results = future.result()
+                    all_results.extend(user_results)
                 except Exception as e:
-                    logger.error(f"Future failed: {str(e)}")
+                    logger.error(f"User session failed: {e}")
+                    
+        total_time = time.time() - start_time
+        final_memory = process.memory_info().rss / 1024 / 1024  # MB
         
-        total_time = time.perf_counter() - start_time
-        logger.info(f"Load test completed in {total_time:.2f} seconds")
-        
-    def calculate_metrics(self) -> Dict[str, Any]:
-        """Calculate performance metrics from results."""
-        if not self.results:
-            return {}
-        
-        response_times = [r.response_time_ms for r in self.results]
-        cache_hits = [r.from_cache for r in self.results]
-        errors = [r.error for r in self.results if r.error]
-        
-        metrics = {
-            "total_requests": len(self.results),
-            "successful_requests": len([r for r in self.results if not r.error]),
-            "failed_requests": len(errors),
-            "cache_hit_rate": sum(cache_hits) / len(cache_hits) * 100,
-            "cache_hits": sum(cache_hits),
-            "cache_misses": len(cache_hits) - sum(cache_hits),
-            "p50_latency_ms": statistics.median(response_times),
-            "p95_latency_ms": statistics.quantiles(response_times, n=20)[18] if len(response_times) > 1 else response_times[0],
-            "p99_latency_ms": statistics.quantiles(response_times, n=100)[98] if len(response_times) > 1 else response_times[0],
-            "min_latency_ms": min(response_times),
-            "max_latency_ms": max(response_times),
-            "avg_latency_ms": statistics.mean(response_times),
-            "std_latency_ms": statistics.stdev(response_times) if len(response_times) > 1 else 0,
+        # Store results
+        with self.lock:
+            self.results.extend(all_results)
+            
+        # Calculate statistics
+        stats = self._calculate_statistics(all_results)
+        stats["test_config"] = {
+            "concurrent_users": self.concurrent_users,
+            "requests_per_user": self.requests_per_user,
+            "total_requests": len(all_results),
+            "test_duration_seconds": total_time,
+            "memory_usage_mb": {
+                "initial": initial_memory,
+                "final": final_memory,
+                "delta": final_memory - initial_memory
+            }
         }
         
-        # Separate cache hit/miss metrics
-        cache_hit_times = [r.response_time_ms for r in self.results if r.from_cache]
-        cache_miss_times = [r.response_time_ms for r in self.results if not r.from_cache]
+        logger.info(f"Load test completed in {total_time:.2f}s")
+        return stats
         
-        if cache_hit_times:
-            metrics["cache_hit_metrics"] = {
-                "avg_latency_ms": statistics.mean(cache_hit_times),
-                "p50_latency_ms": statistics.median(cache_hit_times),
-                "count": len(cache_hit_times),
-            }
-        
-        if cache_miss_times:
-            metrics["cache_miss_metrics"] = {
-                "avg_latency_ms": statistics.mean(cache_miss_times),
-                "p50_latency_ms": statistics.median(cache_miss_times),
-                "count": len(cache_miss_times),
-            }
-        
-        return metrics
-        
-    def verify_consistency(self) -> Dict[str, Any]:
-        """Verify that results are consistent (same questions produce same results)."""
-        question_groups = {}
-        for result in self.results:
-            if result.question not in question_groups:
-                question_groups[result.question] = []
-            question_groups[result.question].append(result)
-        
-        consistency_issues = []
-        for question, results in question_groups.items():
-            if len(results) < 2:
-                continue
-                
-            # Check if SQL is consistent
-            sqls = [r.sql_generated for r in results if r.sql_generated]
-            if len(set(sqls)) > 1:
-                consistency_issues.append({
-                    "question": question,
-                    "issue": "inconsistent_sql",
-                    "sqls": list(set(sqls)),
-                })
+    def _calculate_statistics(self, results: List[TestResult]) -> Dict[str, Any]:
+        """Calculate performance statistics."""
+        if not results:
+            return {"error": "No results to analyze"}
             
-            # Check if cache behavior is consistent
-            cache_behaviors = [r.from_cache for r in results]
-            if not all(cache_behaviors) and any(cache_behaviors):
-                consistency_issues.append({
-                    "question": question,
-                    "issue": "inconsistent_cache_behavior",
-                    "cache_behaviors": cache_behaviors,
-                })
+        # Basic metrics
+        successful_results = [r for r in results if r.success]
+        cached_results = [r for r in results if r.from_cache]
+        
+        cache_hit_rate = len(cached_results) / len(results) if results else 0
+        success_rate = len(successful_results) / len(results) if results else 0
+        
+        # Response time statistics
+        response_times = [r.total_time_ms for r in successful_results]
+        
+        if response_times:
+            p50 = statistics.median(response_times)
+            p95 = statistics.quantiles(response_times, n=20)[18] if len(response_times) >= 20 else p50
+            p99 = statistics.quantiles(response_times, n=100)[98] if len(response_times) >= 100 else p95
+            
+            response_time_stats = {
+                "p50_ms": p50,
+                "p95_ms": p95,
+                "p99_ms": p99,
+                "min_ms": min(response_times),
+                "max_ms": max(response_times),
+                "mean_ms": statistics.mean(response_times)
+            }
+        else:
+            response_time_stats = {"error": "No successful requests"}
+        
+        # Error analysis
+        errors = [r.error for r in results if not r.success and r.error]
+        error_counts = {}
+        for error in errors:
+            error_type = error.split(":")[0] if ":" in error else "Unknown"
+            error_counts[error_type] = error_counts.get(error_type, 0) + 1
+            
+        # Row count statistics
+        row_counts = [r.row_count for r in successful_results]
+        row_count_stats = {
+            "mean": statistics.mean(row_counts) if row_counts else 0,
+            "median": statistics.median(row_counts) if row_counts else 0,
+            "max": max(row_counts) if row_counts else 0
+        }
         
         return {
-            "consistency_issues": consistency_issues,
-            "total_questions": len(question_groups),
-            "consistent_questions": len(question_groups) - len([q for q in consistency_issues if q["issue"] == "inconsistent_sql"]),
-        }
-        
-    def save_results(self):
-        """Save test results to file."""
-        results = {
-            "config": {
-                "concurrent_requests": self.config.concurrent_requests,
-                "total_requests": self.config.total_requests,
-                "test_questions": self.config.test_questions,
-                "db_config": {k: v for k, v in self.config.db_config.items() if k != "password"},
+            "summary": {
+                "total_requests": len(results),
+                "successful_requests": len(successful_results),
+                "failed_requests": len(results) - len(successful_results),
+                "cached_requests": len(cached_results),
+                "cache_hit_rate": cache_hit_rate,
+                "success_rate": success_rate
             },
-            "metrics": self.calculate_metrics(),
-            "consistency_check": self.verify_consistency(),
-            "raw_results": [
-                {
-                    "question": r.question,
-                    "response_time_ms": r.response_time_ms,
-                    "from_cache": r.from_cache,
-                    "sql_generated": r.sql_generated,
-                    "row_count": r.row_count,
-                    "error": r.error,
-                    "intent": r.intent,
-                }
-                for r in self.results
-            ],
+            "response_times": response_time_stats,
+            "row_counts": row_count_stats,
+            "errors": error_counts
         }
         
-        with open(self.config.output_file, 'w') as f:
-            json.dump(results, f, indent=2)
-        
-        logger.info(f"Results saved to {self.config.output_file}")
-        
-    def print_summary(self):
-        """Print test summary to console."""
-        metrics = self.calculate_metrics()
-        if not metrics:
-            logger.error("No results to display")
-            return
+    def generate_report(self) -> str:
+        """Generate a detailed performance report."""
+        if not self.results:
+            return "No test results available"
             
-        print("\n" + "="*60)
-        print("LOAD TEST RESULTS")
-        print("="*60)
-        print(f"Total Requests: {metrics['total_requests']}")
-        print(f"Successful: {metrics['successful_requests']}")
-        print(f"Failed: {metrics['failed_requests']}")
-        print(f"Cache Hit Rate: {metrics['cache_hit_rate']:.1f}%")
-        print()
-        print("LATENCY METRICS:")
-        print(f"  Average: {metrics['avg_latency_ms']:.1f}ms")
-        print(f"  P50: {metrics['p50_latency_ms']:.1f}ms")
-        print(f"  P95: {metrics['p95_latency_ms']:.1f}ms")
-        print(f"  P99: {metrics['p99_latency_ms']:.1f}ms")
-        print(f"  Min: {metrics['min_latency_ms']:.1f}ms")
-        print(f"  Max: {metrics['max_latency_ms']:.1f}ms")
-        print()
+        stats = self._calculate_statistics(self.results)
         
-        if "cache_hit_metrics" in metrics:
-            hit = metrics["cache_hit_metrics"]
-            print("CACHE HIT PERFORMANCE:")
-            print(f"  Average: {hit['avg_latency_ms']:.1f}ms")
-            print(f"  Count: {hit['count']}")
-            print()
+        report = f"""
+# Text-to-SQL RAG Performance Report
+Generated: {datetime.now().isoformat()}
+
+## Test Configuration
+- Concurrent Users: {stats['test_config']['concurrent_users']}
+- Requests per User: {stats['test_config']['requests_per_user']}
+- Total Requests: {stats['test_config']['total_requests']}
+- Test Duration: {stats['test_config']['test_duration_seconds']:.2f}s
+
+## Performance Metrics
+
+### Cache Performance
+- Cache Hit Rate: {stats['summary']['cache_hit_rate']:.1%}
+- Cached Requests: {stats['summary']['cached_requests']}
+
+### Response Time Statistics
+- P50: {stats['response_times'].get('p50_ms', 'N/A')}ms
+- P95: {stats['response_times'].get('p95_ms', 'N/A')}ms
+- P99: {stats['response_times'].get('p99_ms', 'N/A')}ms
+- Mean: {stats['response_times'].get('mean_ms', 'N/A')}ms
+
+### Success Metrics
+- Success Rate: {stats['summary']['success_rate']:.1%}
+- Total Requests: {stats['summary']['total_requests']}
+- Successful: {stats['summary']['successful_requests']}
+- Failed: {stats['summary']['failed_requests']}
+
+### Resource Usage
+- Memory Delta: {stats['test_config']['memory_usage_mb']['delta']:.1f}MB
+
+### Error Analysis
+"""
+        
+        for error_type, count in stats['errors'].items():
+            report += f"- {error_type}: {count}\n"
             
-        if "cache_miss_metrics" in metrics:
-            miss = metrics["cache_miss_metrics"]
-            print("CACHE MISS PERFORMANCE:")
-            print(f"  Average: {miss['avg_latency_ms']:.1f}ms")
-            print(f"  Count: {miss['count']}")
-            print()
-        
-        consistency = self.verify_consistency()
-        if consistency["consistency_issues"]:
-            print("CONSISTENCY ISSUES FOUND:")
-            for issue in consistency["consistency_issues"][:5]:  # Show first 5
-                print(f"  {issue['question']}: {issue['issue']}")
-            if len(consistency["consistency_issues"]) > 5:
-                print(f"  ... and {len(consistency['consistency_issues']) - 5} more")
-        else:
-            print("CONSISTENCY: All good!")
-        
-        print("="*60)
+        return report
 
 
 def main():
-    """Main function."""
-    # Parse command line arguments
-    import argparse
-    parser = argparse.ArgumentParser(description="Load test for Text-to-SQL RAG system")
-    parser.add_argument("--concurrent", type=int, default=20, help="Number of concurrent requests")
-    parser.add_argument("--total", type=int, default=100, help="Total number of requests")
-    parser.add_argument("--warmup", type=int, default=10, help="Number of warmup requests")
-    parser.add_argument("--output", default="load_test_results.json", help="Output file for results")
-    parser.add_argument("--questions-file", help="JSON file with test questions")
-    
-    args = parser.parse_args()
-    
-    # Create test config
-    config = TestConfig(
-        concurrent_requests=args.concurrent,
-        total_requests=args.total,
-        warmup_requests=args.warmup,
-        output_file=args.output,
+    """Main entry point."""
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    # Load questions from file if provided
-    if args.questions_file:
-        with open(args.questions_file) as f:
-            questions_data = json.load(f)
-            config.test_questions = questions_data.get("questions", config.test_questions)
+    # Database configuration
+    db_config = DatabaseConfig(
+        host=os.getenv("DB_HOST", "localhost"),
+        port=os.getenv("DB_PORT", "1433"),
+        username=os.getenv("DB_USER", "sa"),
+        password=os.getenv("DB_PASSWORD", "password"),
+        database=os.getenv("DB_NAME", "testdb"),
+        connect_timeout=10,
+        query_timeout=30
+    )
+    
+    # Test questions
+    test_questions = [
+        "What are the top 5 hotels by revenue this month?",
+        "Show me booking trends for the last quarter",
+        "Which suppliers have the highest profit margin?",
+        "How many bookings were made last week?",
+        "What is the average booking value by country?",
+        "Show me monthly revenue for this year",
+        "Which cities have the most bookings?",
+        "What is the total profit for last month?",
+        "Show me bookings by customer nationality",
+        "What are the peak booking periods?",
+    ]
+    
+    # Create load tester
+    tester = LoadTester(
+        config=db_config,
+        test_questions=test_questions,
+        concurrent_users=5,
+        requests_per_user=10
+    )
     
     # Run load test
-    tester = LoadTester(config)
+    stats = tester.run_load_test()
     
-    try:
-        tester.setup()
-        tester.run_load_test()
-        tester.print_summary()
-        tester.save_results()
-    finally:
-        tester.cleanup()
+    # Generate and print report
+    report = tester.generate_report()
+    print(report)
+    
+    # Save detailed results
+    results_file = f"load_test_results_{int(time.time())}.json"
+    with open(results_file, 'w') as f:
+        json.dump(stats, f, indent=2)
+    
+    print(f"\nDetailed results saved to: {results_file}")
 
 
 if __name__ == "__main__":

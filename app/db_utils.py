@@ -62,25 +62,6 @@ def _set_cached_engine(connection_uri: str, engine: Engine) -> None:
             keys_to_remove = list(_ENGINE_CACHE.keys())[:-50]
             for key in keys_to_remove:
                 _ENGINE_CACHE.pop(key, None)
-_ENGINE_CACHE: Dict[str, Engine] = {}
-_ENGINE_CACHE_LOCK = threading.RLock()
-_ENGINE_CACHE_TTL = 3600  # 1 hour TTL
-
-
-def _get_cached_engine(connection_uri: str) -> Optional[Engine]:
-    """Get cached engine by connection URI."""
-    with _ENGINE_CACHE_LOCK:
-        engine = _ENGINE_CACHE.get(connection_uri)
-        if engine:
-            # Check if engine is still alive
-            try:
-                with engine.connect() as conn:
-                    conn.execute(text("SELECT 1"))
-                return engine
-            except Exception:
-                # Engine is dead, remove from cache
-                _ENGINE_CACHE.pop(connection_uri, None)
-    return None
 
 
 def _set_cached_engine(connection_uri: str, engine: Engine) -> None:
@@ -172,11 +153,18 @@ def create_engine_with_timeout(config: DatabaseConfig) -> Engine:
         pool_recycle=300,    # Recycle connections every 5 minutes (remote DBs drop idle connections)
         pool_size=5,
         max_overflow=10,
+        # SQL Server specific optimizations
+        isolation_level="READ UNCOMMITTED",  # Reduce locking contention
+        echo=False,  # Disable SQL logging for performance
+        echo_pool=False,  # Disable pool logging for performance
     )
 
     # Warm up the connection pool — first query is faster
     try:
         with engine.connect() as conn:
+            # Set SQL Server specific session options for performance
+            conn.execute(text("SET DEADLOCK_PRIORITY LOW"))
+            conn.execute(text("SET LOCK_TIMEOUT 5000"))  # 5 second lock timeout
             conn.execute(text("SELECT 1"))
         # Cache the engine after successful warmup
         _set_cached_engine(config.connection_uri, engine)
@@ -216,7 +204,7 @@ def create_database_with_views(config: DatabaseConfig) -> SQLDatabase:
 @contextmanager
 def query_timeout_context(seconds: int):
     """
-    Context manager for query timeout using threading (cross-platform).
+    Context manager for query timeout using shared runtime executor.
 
     Usage:
         with query_timeout_context(30):
@@ -224,13 +212,12 @@ def query_timeout_context(seconds: int):
     """
     class TimeoutContext:
         def run(self, func, *args, **kwargs):
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(func, *args, **kwargs)
-                try:
-                    return future.result(timeout=seconds)
-                except FuturesTimeoutError as exc:
-                    future.cancel()
-                    raise QueryTimeoutError(f"Query exceeded {seconds} second timeout") from exc
+            # Use shared runtime executor instead of creating new ThreadPoolExecutor
+            from backend.services.runtime import run_with_timeout
+            try:
+                return run_with_timeout(func, timeout_seconds=seconds, *args, **kwargs)
+            except FuturesTimeoutError as exc:
+                raise QueryTimeoutError(f"Query exceeded {seconds} second timeout") from exc
 
     yield TimeoutContext()
 

@@ -5876,27 +5876,29 @@ def handle_query(
         prompt_context = _build_prompt_context_from_state(session_state, conversation_context, conversation_turns)
 
         t_sql_gen = time.perf_counter()
-            # Process RAG context if available
-            examples = rag_context.get("examples", [])[:3] if rag_context else []
-            raw_tables = rag_context.get("tables", []) if rag_context else []
-            rag_table_hints = [
-                t["table"] if isinstance(t, dict) else str(t)
-                for t in raw_tables
-                if t
-            ]
-            if examples:
-                parts = ["EXAMPLE QUERIES (follow these patterns closely):"]
-                for ex in examples:
-                    q = ex.get("question", "")
-                    s = ex.get("sql", "")
-                    if q and s:
-                        parts.append(f"Q: {q}\nSQL: {s}")
-                few_shot_str = "\n\n".join(parts)
-                logger.info(f"Injected {len(examples)} few-shot examples from RAG")
-                log_event(logger, logging.INFO, "rag_retrieval_result",
-                         examples_count=len(examples),
-                         tables_count=len(rag_table_hints),
-                         retrieval_skipped=rag_context.get("skipped", False) if rag_context else True)
+        timer.mark("rag_retrieval")
+        
+        # Process RAG context if available
+        examples = rag_context.get("examples", [])[:3] if rag_context else []
+        raw_tables = rag_context.get("tables", []) if rag_context else []
+        rag_table_hints = [
+            t["table"] if isinstance(t, dict) else str(t)
+            for t in raw_tables
+            if t
+        ]
+        if examples:
+            parts = ["EXAMPLE QUERIES (follow these patterns closely):"]
+            for ex in examples:
+                q = ex.get("question", "")
+                s = ex.get("sql", "")
+                if q and s:
+                    parts.append(f"Q: {q}\nSQL: {s}")
+            few_shot_str = "\n\n".join(parts)
+            logger.info(f"Injected {len(examples)} few-shot examples from RAG")
+            log_event(logger, logging.INFO, "rag_retrieval_result",
+                     examples_count=len(examples),
+                     tables_count=len(rag_table_hints),
+                     retrieval_skipped=rag_context.get("skipped", False) if rag_context else True)
             else:
                 few_shot_str = ""
                 log_event(logger, logging.INFO, "rag_retrieval_empty", 
@@ -5919,7 +5921,18 @@ def handle_query(
         effective_few_shot = prompt_payload["few_shot_examples"]
         retrieved_tables_hint = ", ".join(rag_table_hints[:6]) if rag_table_hints else (session_state.get("last_table") or "none")
 
+        # Log prompt size for monitoring
+        total_prompt_size = len(effective_schema_text) + len(effective_guidance) + len(effective_prompt_context) + len(effective_few_shot)
+        log_event(logger, logging.INFO, "prompt_size_check",
+                 schema_chars=len(effective_schema_text),
+                 guidance_chars=len(effective_guidance),
+                 context_chars=len(effective_prompt_context),
+                 few_shot_chars=len(effective_few_shot),
+                 total_chars=total_prompt_size,
+                 budget=PROMPT_BUDGET_CHARS)
+
         # ── LLM SQL generation ──
+        timer.mark("sql_generation_prep")
         # pre_complexity = _estimate_query_complexity(question)
         # use_reasoning = (
         #     reasoning_llm is not None
@@ -6032,6 +6045,8 @@ def handle_query(
                         raise
 
             generation_ms = (time.perf_counter() - t_sql_gen) * 1000
+            timer.mark("sql_generation")
+            
             if not fallback_used and generation_ms > LLM_SQL_TIMEOUT_MS:
                 if _try_deterministic_timeout_fallback("slow_generation"):
                     generation_ms = (time.perf_counter() - t_sql_gen) * 1000
@@ -6040,6 +6055,15 @@ def handle_query(
                 cleaned_query = _clean_sql_response(resp_text.strip())
                 cleaned_query = fix_common_sql_errors(cleaned_query, dialect=active_dialect)
                 is_valid, validation_msg = validate_sql(cleaned_query)
+
+                # Log SQL generation results
+                log_event(logger, logging.INFO, "sql_generation_complete",
+                        generation_ms=generation_ms,
+                        sql_length=len(cleaned_query),
+                        is_valid=is_valid,
+                        fallback_used=fallback_used,
+                        use_reasoning=use_reasoning,
+                        query_complexity=_query_complexity if '_query_complexity' in locals() else 'unknown')
 
                 if is_valid and ENABLE_SQL_VALIDATOR:
                     validator_context = {

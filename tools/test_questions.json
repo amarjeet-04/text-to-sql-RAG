@@ -1,24 +1,22 @@
-{
-  "questions": [
-    "show top 10 agents by revenue",
-    "total bookings this month",
-    "which supplier has highest bookings",
-    "revenue by country last week",
-    "profit by agent this year",
-    "top 5 hotels by bookings",
-    "average booking value",
-    "total cancelled bookings",
-    "bookings by agent type",
-    "revenue trend this month",
-    "show me sales by country",
-    "what are the top agents",
-    "hotel bookings last month",
-    "supplier performance this year",
-    "agent revenue comparison",
-    "booking statistics",
-    "top destinations",
-    "average profit margin",
-    "monthly bookings trend",
-    "agent wise revenue"
-  ]
-}
+[
+  "What are the top 5 hotels by revenue this month?",
+  "Show me booking trends for the last quarter",
+  "Which suppliers have the highest profit margin?",
+  "How many bookings were made last week?",
+  "What is the average booking value by country?",
+  "Show me monthly revenue for this year",
+  "Which cities have the most bookings?",
+  "What is the total profit for last month?",
+  "Show me bookings by customer nationality",
+  "What are the peak booking periods?",
+  "Compare revenue between this month and last month",
+  "Show me the top 10 customers by booking value",
+  "What is the average daily rate for each hotel?",
+  "Which booking channels generate most revenue?",
+  "Show me cancellation rates by month",
+  "What is the average length of stay?",
+  "Which room types are most popular?",
+  "Show me revenue by agent",
+  "What are the booking patterns by day of week?",
+  "Show me profit margin by hotel chain"
+]
