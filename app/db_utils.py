@@ -17,7 +17,82 @@ from sqlalchemy import create_engine, text, event
 from sqlalchemy.engine import Engine
 from langchain_community.utilities import SQLDatabase
 
+# Import shared runtime utilities for thread-safe execution
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from backend.services.runtime import run_with_timeout, log_event
+
+# Import caching utilities
+from functools import lru_cache
+import threading
+
 logger = logging.getLogger("db_utils")
+
+
+# Global engine cache with TTL
+_ENGINE_CACHE: Dict[str, Engine] = {}
+_ENGINE_CACHE_LOCK = threading.RLock()
+_ENGINE_CACHE_TTL = 3600  # 1 hour TTL
+
+
+def _get_cached_engine(connection_uri: str) -> Optional[Engine]:
+    """Get cached engine by connection URI."""
+    with _ENGINE_CACHE_LOCK:
+        engine = _ENGINE_CACHE.get(connection_uri)
+        if engine:
+            # Check if engine is still alive
+            try:
+                with engine.connect() as conn:
+                    conn.execute(text("SELECT 1"))
+                return engine
+            except Exception:
+                # Engine is dead, remove from cache
+                _ENGINE_CACHE.pop(connection_uri, None)
+    return None
+
+
+def _set_cached_engine(connection_uri: str, engine: Engine) -> None:
+    """Cache engine by connection URI."""
+    with _ENGINE_CACHE_LOCK:
+        _ENGINE_CACHE[connection_uri] = engine
+        # Limit cache size to prevent memory issues
+        if len(_ENGINE_CACHE) > 100:
+            # Remove oldest entries
+            keys_to_remove = list(_ENGINE_CACHE.keys())[:-50]
+            for key in keys_to_remove:
+                _ENGINE_CACHE.pop(key, None)
+_ENGINE_CACHE: Dict[str, Engine] = {}
+_ENGINE_CACHE_LOCK = threading.RLock()
+_ENGINE_CACHE_TTL = 3600  # 1 hour TTL
+
+
+def _get_cached_engine(connection_uri: str) -> Optional[Engine]:
+    """Get cached engine by connection URI."""
+    with _ENGINE_CACHE_LOCK:
+        engine = _ENGINE_CACHE.get(connection_uri)
+        if engine:
+            # Check if engine is still alive
+            try:
+                with engine.connect() as conn:
+                    conn.execute(text("SELECT 1"))
+                return engine
+            except Exception:
+                # Engine is dead, remove from cache
+                _ENGINE_CACHE.pop(connection_uri, None)
+    return None
+
+
+def _set_cached_engine(connection_uri: str, engine: Engine) -> None:
+    """Cache engine by connection URI."""
+    with _ENGINE_CACHE_LOCK:
+        _ENGINE_CACHE[connection_uri] = engine
+        # Limit cache size to prevent memory issues
+        if len(_ENGINE_CACHE) > 100:
+            # Remove oldest entries
+            keys_to_remove = list(_ENGINE_CACHE.keys())[:-50]
+            for key in keys_to_remove:
+                _ENGINE_CACHE.pop(key, None)
 
 
 @dataclass
@@ -79,10 +154,18 @@ class QueryExecutionError(Exception):
 def create_engine_with_timeout(config: DatabaseConfig) -> Engine:
     """
     Create SQLAlchemy engine with connection and query timeouts.
+    Uses caching by connection URI to avoid recreating engines.
 
     Uses ODBC Driver 18 for SQL Server (faster than pymssql).
     Timeouts are set in the ODBC connection string via connection_uri.
     """
+    # Check cache first
+    cached_engine = _get_cached_engine(config.connection_uri)
+    if cached_engine:
+        log_event(logger, logging.DEBUG, "engine_cache_hit", connection_uri_hash=hash(config.connection_uri))
+        return cached_engine
+    
+    # Create new engine
     engine = create_engine(
         config.connection_uri,
         pool_pre_ping=True,  # Verify connections before use
@@ -95,8 +178,12 @@ def create_engine_with_timeout(config: DatabaseConfig) -> Engine:
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-    except Exception:
-        pass  # Pool warming is best-effort; actual errors surface on real queries
+        # Cache the engine after successful warmup
+        _set_cached_engine(config.connection_uri, engine)
+        log_event(logger, logging.INFO, "engine_created_and_cached", connection_uri_hash=hash(config.connection_uri))
+    except Exception as e:
+        # Pool warming is best-effort; actual errors surface on real queries
+        logger.debug(f"Engine warmup failed: {e}")
 
     return engine
 
@@ -171,6 +258,13 @@ def execute_query_safe(
 ) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
     """
     Execute a SQL query with timeout protection and row limiting.
+    
+    Uses shared runtime executor instead of per-call ThreadPoolExecutor.
+    
+    SQL Server optimizations:
+    - SET DEADLOCK_PRIORITY LOW
+    - SET LOCK_TIMEOUT
+    - SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED (if consistent with NOLOCK)
 
     Args:
         db: LangChain SQLDatabase instance
@@ -222,27 +316,47 @@ def execute_query_safe(
     attempt = 0
     while True:
         try:
-            with engine.connect() as conn:
-                result_proxy = conn.execute(text(query_stripped))
-                columns = list(result_proxy.keys())
-                # fetchmany in chunks avoids materialising the full result set
-                # in one blocking call — the driver returns control sooner for
-                # large result sets and keeps peak memory lower.
-                chunk_size = 500
-                rows: list = []
-                while True:
-                    chunk = result_proxy.fetchmany(chunk_size)
-                    if not chunk:
-                        break
-                    rows.extend(chunk)
-                    if len(rows) >= max_rows:
-                        rows = rows[:max_rows]
-                        break
+            def _execute_query():
+                with engine.connect() as conn:
+                    # SQL Server optimizations for faster execution
+                    dialect = (getattr(getattr(engine, "dialect", None), "name", "") or "").lower()
+                    if "mssql" in dialect:
+                        # Reduce deadlock likelihood and improve concurrency
+                        conn.execute(text("SET DEADLOCK_PRIORITY LOW"))
+                        # Set lock timeout to prevent long waits
+                        lock_timeout_ms = int(timeout_seconds * 1000)
+                        conn.execute(text(f"SET LOCK_TIMEOUT {lock_timeout_ms}"))
+                        # Use read uncommitted if consistent with NOLOCK usage
+                        # This matches the existing NOLOCK pattern in the codebase
+                        conn.execute(text("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED"))
+                    
+                    result_proxy = conn.execute(text(query_stripped))
+                    columns = list(result_proxy.keys())
+                    # fetchmany in chunks avoids materialising the full result set
+                    # in one blocking call — the driver returns control sooner for
+                    # large result sets and keeps peak memory lower.
+                    chunk_size = 500
+                    rows: list = []
+                    while True:
+                        chunk = result_proxy.fetchmany(chunk_size)
+                        if not chunk:
+                            break
+                        rows.extend(chunk)
+                        if len(rows) >= max_rows:
+                            rows = rows[:max_rows]
+                            break
 
-            if rows:
-                df = pd.DataFrame(rows, columns=columns)
-                return df, None
-            return pd.DataFrame(), None
+                if rows:
+                    df = pd.DataFrame(rows, columns=columns)
+                    return df, None
+                return pd.DataFrame(), None
+            
+            # Use shared runtime executor for timeout protection
+            result = run_with_timeout(_execute_query, timeout_seconds)
+            return result
+            
+        except FuturesTimeoutError:
+            return None, f"Query timed out after {timeout_seconds} seconds. Try a more specific query."
         except sqlalchemy.exc.OperationalError as e:
             error_str = str(e)
             if attempt < max_retries and _is_transient_operational_error(error_str):

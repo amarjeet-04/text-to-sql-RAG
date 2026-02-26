@@ -40,6 +40,27 @@ from backend.services.runtime import run_with_timeout, submit_background_task, l
 
 logger = logging.getLogger("sql_engine")
 
+# ChatOpenAI singleton cache
+_CACHED_CHAT_OPENAI: Dict[Tuple[str, str, int], ChatOpenAI] = {}
+_CACHED_CHAT_OPENAI_LOCK = threading.RLock()
+
+
+def get_cached_chat_openai(model: str, api_base: Optional[str] = None, timeout: int = 15000) -> ChatOpenAI:
+    """Get or create cached ChatOpenAI instance."""
+    key = (model, api_base or "", timeout)
+    
+    with _CACHED_CHAT_OPENAI_LOCK:
+        if key not in _CACHED_CHAT_OPENAI:
+            _CACHED_CHAT_OPENAI[key] = ChatOpenAI(
+                model=model,
+                temperature=0,
+                openai_api_key=os.getenv("OPENAI_API_KEY", ""),
+                openai_api_base=api_base,
+                request_timeout=timeout / 1000,  # Convert to seconds
+            )
+            log_event(logger, logging.INFO, "chat_openai_created", model=model)
+        return _CACHED_CHAT_OPENAI[key]
+
 # --- Constants ---
 FOLLOW_UP_WORDS = {"that", "those", "it", "them", "this", "more", "instead", "above"}
 DATABASE_ENTITY_WORDS = {
@@ -154,6 +175,68 @@ RANKING_ENTITY_TOKENS = [
 _SCHEMA_PROFILE_CACHE: Dict[int, Dict[str, Any]] = {}
 _TABLE_EXISTS_CACHE: Dict[Tuple[int, str], bool] = {}
 _SCHEMA_RUNTIME_LOCK = threading.RLock()
+
+
+# Singleflight pattern to prevent duplicate expensive work
+_SINGLEFLIGHT_LOCKS: Dict[str, Tuple[threading.Lock, float]] = {}
+_SINGLEFLIGHT_LOCK = threading.RLock()
+_SINGLEFLIGHT_TTL = 30.0  # 30 seconds TTL for locks
+
+
+def _get_singleflight_lock(key: str) -> threading.Lock:
+    """Get or create a singleflight lock for a given key."""
+    with _SINGLEFLIGHT_LOCK:
+        now = time.time()
+        
+        # Clean up expired locks
+        expired_keys = [
+            k for k, (lock, timestamp) in _SINGLEFLIGHT_LOCKS.items()
+            if now - timestamp > _SINGLEFLIGHT_TTL
+        ]
+        for k in expired_keys:
+            _SINGLEFLIGHT_LOCKS.pop(k, None)
+        
+        # Return existing or create new lock
+        if key in _SINGLEFLIGHT_LOCKS:
+            lock, timestamp = _SINGLEFLIGHT_LOCKS[key]
+            _SINGLEFLIGHT_LOCKS[key] = (lock, now)  # Update timestamp
+            return lock
+        else:
+            lock = threading.Lock()
+            _SINGLEFLIGHT_LOCKS[key] = (lock, now)
+            return lock
+
+
+def singleflight(key: str, fn, *args, **kwargs):
+    """
+    Singleflight pattern: ensures only one execution of fn happens for a given key.
+    Other concurrent calls wait and return the same result.
+    
+    Args:
+        key: Unique identifier for the operation
+        fn: Function to execute
+        *args, **kwargs: Arguments to pass to fn
+        
+    Returns:
+        Result of fn(*args, **kwargs)
+    """
+    lock = _get_singleflight_lock(key)
+    
+    with lock:
+        # Check if we have a cached result from a previous execution
+        cache_key = f"singleflight_result:{key}"
+        if hasattr(_SINGLEFLIGHT_LOCKS, cache_key):
+            result = getattr(_SINGLEFLIGHT_LOCKS, cache_key)
+            delattr(_SINGLEFLIGHT_LOCKS, cache_key)
+            return result
+        
+        # Execute the function
+        result = fn(*args, **kwargs)
+        
+        # Store result for other threads that might be waiting
+        setattr(_SINGLEFLIGHT_LOCKS, cache_key, result)
+        
+        return result
 
 
 # --- Global Schema Cache (cross-session) ---
@@ -424,6 +507,22 @@ class StepTimer:
         # Ensure total reflects start -> total even if intermediates are missing.
         out["total"] = round((marks["total"] - marks["start"]) * 1000.0, 2)
         return out
+
+    def log_stage_summary(self, logger, level=logging.INFO, request_id=None, session_id=None):
+        """Log stage timings as structured JSON for monitoring."""
+        summary = self.summary()
+        stage_timings = {stage: summary.get(stage, 0.0) for stage in self.STAGES}
+        
+        # Log with structured fields for easy parsing/monitoring
+        log_event(
+            logger,
+            level,
+            "request_stage_timings",
+            request_id=request_id or get_request_id(),
+            session_id=session_id or get_session_id(),
+            stage_timings=stage_timings,
+            total_ms=summary.get("total", 0.0)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -4362,11 +4461,14 @@ def find_cached_result(
     db: Optional[SQLDatabase] = None,
 ):
     if is_time_sensitive(question=question, sql=""):
+        log_event(logger, logging.DEBUG, "session_cache_skip_time_sensitive")
         return None, None
     entries = _snapshot_query_cache(query_cache)
     if not entries:
+        log_event(logger, logging.DEBUG, "session_cache_empty")
         return None, None
     if is_followup_question(question):
+        log_event(logger, logging.DEBUG, "session_cache_skip_followup")
         return None, None
 
     cache_key = _make_query_cache_key(question, db)
@@ -5150,6 +5252,8 @@ def _build_prompt_payload(
     }
 
     if total_prompt_chars <= PROMPT_BUDGET_CHARS:
+        log_event(logger, logging.DEBUG, "prompt_budget_ok", 
+                 total_chars=total_prompt_chars, budget=PROMPT_BUDGET_CHARS)
         return payload
 
     # Budget overflow: compress all high-cardinality blocks.
@@ -5163,6 +5267,14 @@ def _build_prompt_payload(
         + len(payload["prompt_context"])
         + len(payload["few_shot_examples"])
     )
+    log_event(logger, logging.INFO, "prompt_budget_compression_applied",
+             original_size=total_prompt_chars,
+             compressed_size=new_combined,
+             budget=PROMPT_BUDGET_CHARS,
+             schema_size=len(payload["schema_text"]),
+             guidance_size=len(payload["stored_guidance"]),
+             context_size=len(payload["prompt_context"]),
+             few_shot_size=len(payload["few_shot_examples"]))
     logger.info(
         "Prompt budget compression applied schema=%s guidance=%s context=%s few_shot=%s combined=%s limit=%s",
         len(payload["schema_text"]),
@@ -5471,6 +5583,10 @@ def handle_query(
         payload.setdefault("fallback_used", fallback_used_request)
         payload.setdefault("query_complexity", _query_complexity)
         payload["timing"] = timer.summary()
+        
+        # Log detailed stage timings
+        timer.log_stage_summary(logger)
+        
         log_event(
             logger,
             logging.INFO,
@@ -5478,6 +5594,11 @@ def handle_query(
             total_ms=payload["timing"].get("total", 0.0),
             from_cache=bool(payload.get("from_cache", False)),
             has_error=bool(payload.get("error")),
+            intent=intent,
+            query_complexity=_query_complexity,
+            fallback_used=bool(fallback_used_request),
+            rag_skipped=skip_rag_retrieval,
+            cache_hit=bool(payload.get("from_cache", False)),
         )
         if payload["timing"].get("total", 0.0) > 5000:
             logger.warning("SLOW QUERY: %s", payload["timing"])
@@ -5497,7 +5618,12 @@ def handle_query(
         else:
             schema_summary = ", ".join(db.get_usable_table_names()) if db else ""
             intent = detect_intent_llm(question, schema_summary, llm, conversation_context)
-    logger.info(f"Intent detected: {intent} ({(time.perf_counter()-t_intent)*1000:.0f}ms) | Q: {question[:80]}")
+    intent_duration = (time.perf_counter() - t_intent) * 1000
+    logger.info(f"Intent detected: {intent} ({intent_duration:.0f}ms) | Q: {question[:80]}")
+    log_event(logger, logging.INFO, "intent_detection_result",
+             intent=intent,
+             intent_duration_ms=intent_duration,
+             question_length=len(question or ""))
     timer.mark("intent_detection")
 
     # Auto-routing: classify question complexity once, used for model+prompt selection below.
@@ -5612,6 +5738,37 @@ def handle_query(
         ### FAST PATH: skip cache lookups for follow-up/time-sensitive prompts.
         is_followup = is_followup_question(question)
         cache_bypassed = is_followup or is_time_sensitive(question=question, sql="")
+        
+        # Start RAG retrieval in background if needed
+        rag_future = None
+        q_word_count = len(re.findall(r"[A-Za-z0-9_]+", question or ""))
+        skip_rag_retrieval = bool(
+            is_sort_request
+            or is_filter_mod
+            or _is_short_contextual_followup(question)
+            or _is_bare_topn_followup(question)
+            or is_followup
+            or q_word_count < 7
+        )
+        
+        if rag_engine and not skip_rag_retrieval and not cache_bypassed:
+            # Start RAG retrieval in background while we check cache
+            try:
+                rag_future = submit_background_task(
+                    rag_engine.retrieve,
+                    question,
+                    top_k=2,
+                    fast_mode=True,
+                    skip_for_followup=False,
+                    intent_key=_extract_query_topic(question, previous_sql or ""),
+                )
+                log_event(logger, logging.INFO, "rag_retrieval_started_background",
+                         q_word_count=q_word_count,
+                         skip_reason="none")
+            except Exception:
+                logger.warning("Failed to start background RAG retrieval", exc_info=True)
+                rag_future = None
+        
         if cache_bypassed:
             cached_sql, cached_df = None, None
             log_event(
@@ -5625,8 +5782,24 @@ def handle_query(
         else:
             # Check global cache first, then session cache
             cached_sql, cached_df = _GLOBAL_QUERY_CACHE.find(question, embedder, db=db)
+            cache_scope = "global"
             if cached_sql is None:
                 cached_sql, cached_df = find_cached_result(question, query_cache, embedder, db=db)
+                cache_scope = "session" if cached_sql else "none"
+            
+            log_event(logger, logging.INFO, "cache_lookup_result",
+                     cache_scope=cache_scope,
+                     cache_hit=bool(cached_sql),
+                     question_length=len(question or ""))
+            
+            # If cache hit, we can cancel the RAG future if it exists
+            if cached_sql is not None and rag_future:
+                try:
+                    rag_future.cancel()
+                    log_event(logger, logging.INFO, "rag_retrieval_cancelled", reason="cache_hit")
+                except Exception:
+                    pass  # Best effort cancellation
+        
         timer.mark("cache_lookup")
         if cached_sql is not None:
             log_event(logger, logging.INFO, "query_cache_hit", scope="global_or_session")
@@ -5641,6 +5814,15 @@ def handle_query(
                 columns=list(cached_df.columns) if hasattr(cached_df, "columns") else [],
                 row_count=len(results), status="cache",
             )
+            
+            # Log cache hit details with stage timings
+            log_event(logger, logging.INFO, "cache_hit_complete",
+                     intent="DATA_QUERY",
+                     sql_length=len(cached_sql),
+                     result_rows=len(results),
+                     rag_skipped=skip_rag_retrieval,
+                     cache_scope=cache_scope if 'cache_scope' in locals() else 'unknown')
+            
             return _finalize_result({
                 "intent": "DATA_QUERY",
                 "nl_answer": None,
@@ -5655,54 +5837,70 @@ def handle_query(
             })
         else:
             log_event(logger, logging.INFO, "query_cache_miss", scope="global_and_session")
+            # Mark cache lookup stage even on miss to ensure proper timing
+            timer.mark("cache_lookup")
+            
+            # Use singleflight to prevent duplicate RAG retrieval for identical questions
+            rag_cache_key = f"rag_retrieve:{question}:{_extract_query_topic(question, previous_sql or '')}:2"
+            
+            # Wait for RAG retrieval if it was started, or start it now if not
+            if rag_future:
+                try:
+                    rag_context = rag_future.result(timeout=2.0)  # 2 second timeout
+                    log_event(logger, logging.INFO, "rag_retrieval_completed",
+                             retrieval_time_ms=2000,  # Max time we waited
+                             has_results=bool(rag_context))
+                except FuturesTimeoutError:
+                    log_event(logger, logging.WARNING, "rag_retrieval_timeout", timeout_ms=2000)
+                    # Fallback to singleflight RAG retrieval
+                    rag_context = singleflight(rag_cache_key, rag_engine.retrieve,
+                                              question, top_k=2, fast_mode=True,
+                                              skip_for_followup=False,
+                                              intent_key=_extract_query_topic(question, previous_sql or ""))
+                except Exception as e:
+                    logger.warning("Background RAG retrieval failed", exc_info=True)
+                    log_event(logger, logging.WARNING, "rag_retrieval_error", error=str(e))
+                    # Fallback to singleflight RAG retrieval
+                    rag_context = singleflight(rag_cache_key, rag_engine.retrieve,
+                                              question, top_k=2, fast_mode=True,
+                                              skip_for_followup=False,
+                                              intent_key=_extract_query_topic(question, previous_sql or ""))
+            else:
+                # Use singleflight to prevent concurrent RAG retrievals
+                rag_context = singleflight(rag_cache_key, rag_engine.retrieve,
+                                          question, top_k=2, fast_mode=True,
+                                          skip_for_followup=False,
+                                          intent_key=_extract_query_topic(question, previous_sql or ""))
 
         # CHANGED: structured state is primary prompt memory; raw text is secondary.
         prompt_context = _build_prompt_context_from_state(session_state, conversation_context, conversation_turns)
 
         t_sql_gen = time.perf_counter()
-        # Retrieve few-shot examples from RAG for better SQL generation
-        few_shot_str = ""
-        rag_table_hints: List[str] = []
-        rag_context: Dict[str, Any] = {}
-        q_word_count = len(re.findall(r"[A-Za-z0-9_]+", question or ""))
-        skip_rag_retrieval = bool(
-            is_sort_request
-            or is_filter_mod
-            or _is_short_contextual_followup(question)
-            or _is_bare_topn_followup(question)
-            or is_followup_question(question)
-            or q_word_count < 7
-        )
-        if rag_engine and not skip_rag_retrieval:
-            try:
-                rag_context = rag_engine.retrieve(
-                    question,
-                    top_k=2,
-                    fast_mode=True,
-                    skip_for_followup=False,
-                    intent_key=_extract_query_topic(question, previous_sql or ""),
-                )
-                examples = rag_context.get("examples", [])[:3]
-                raw_tables = rag_context.get("tables", []) or []
-                rag_table_hints = [
-                    t["table"] if isinstance(t, dict) else str(t)
-                    for t in raw_tables
-                    if t
-                ]
-                if examples:
-                    parts = ["EXAMPLE QUERIES (follow these patterns closely):"]
-                    for ex in examples:
-                        q = ex.get("question", "")
-                        s = ex.get("sql", "")
-                        if q and s:
-                            parts.append(f"Q: {q}\nSQL: {s}")
-                    few_shot_str = "\n\n".join(parts)
-                    logger.info(f"Injected {len(examples)} few-shot examples from RAG")
-            except Exception:
-                logger.warning("RAG retrieval failed for few-shot examples", exc_info=True)
-        elif rag_engine and skip_rag_retrieval:
-            logger.info("Skipped RAG retrieval for follow-up/short-context query")
-        timer.mark("rag_retrieval")
+            # Process RAG context if available
+            examples = rag_context.get("examples", [])[:3] if rag_context else []
+            raw_tables = rag_context.get("tables", []) if rag_context else []
+            rag_table_hints = [
+                t["table"] if isinstance(t, dict) else str(t)
+                for t in raw_tables
+                if t
+            ]
+            if examples:
+                parts = ["EXAMPLE QUERIES (follow these patterns closely):"]
+                for ex in examples:
+                    q = ex.get("question", "")
+                    s = ex.get("sql", "")
+                    if q and s:
+                        parts.append(f"Q: {q}\nSQL: {s}")
+                few_shot_str = "\n\n".join(parts)
+                logger.info(f"Injected {len(examples)} few-shot examples from RAG")
+                log_event(logger, logging.INFO, "rag_retrieval_result",
+                         examples_count=len(examples),
+                         tables_count=len(rag_table_hints),
+                         retrieval_skipped=rag_context.get("skipped", False) if rag_context else True)
+            else:
+                few_shot_str = ""
+                log_event(logger, logging.INFO, "rag_retrieval_empty", 
+                         skip_reason="no_examples_found" if rag_context else "background_failed")
 
         prompt_payload = _build_prompt_payload(
             question=question,
@@ -5785,10 +5983,10 @@ def handle_query(
                     #               complex_llm → configured model + full chain-of-thought
                     if _query_complexity == "simple_llm":
                         _direct_model = os.getenv("LLM_MODEL_SIMPLE", "gpt-4o-mini")
-                        _direct_llm = ChatOpenAI(
+                        _direct_llm = get_cached_chat_openai(
                             model=_direct_model,
-                            temperature=0,
-                            openai_api_key=llm.openai_api_key if hasattr(llm, "openai_api_key") else os.getenv("OPENAI_API_KEY", ""),
+                            api_base=llm.openai_api_base if hasattr(llm, "openai_api_base") else None,
+                            timeout=LLM_SQL_TIMEOUT_MS
                         )
                         _direct_chain = (
                             ChatPromptTemplate.from_template(DIRECT_SQL_TEMPLATE)
@@ -6009,6 +6207,14 @@ def handle_query(
         )
         guardrails_applied = _get_last_perf_guardrails()
         timer.mark("guardrails_applied")
+        
+        # Log guardrails applied
+        if guardrails_applied:
+            log_event(logger, logging.INFO, "guardrails_applied",
+                     guardrails_applied=guardrails_applied,
+                     guardrails_count=len(guardrails_applied))
+        else:
+            log_event(logger, logging.DEBUG, "no_guardrails_applied")
 
         # Adjust timeout based on query complexity
         base_timeout = getattr(db_config, "query_timeout", 30)
@@ -6075,6 +6281,16 @@ def handle_query(
         timer.mark("db_execution")
         total_ms = (time.perf_counter() - t_start) * 1000
         row_count = len(df) if df is not None else 0
+        
+        # Log detailed DB execution metrics
+        log_event(logger, logging.INFO, "db_execution_complete",
+                 execution_time_ms=round(exec_ms, 2),
+                 row_count=row_count,
+                 has_error=bool(error),
+                 sql_length=len(cleaned_query),
+                 total_query_time_ms=round(total_ms, 2),
+                 query_complexity=_query_complexity)
+        
         logger.info(f"Query executed ({exec_ms:.0f}ms), rows={row_count}, error={error is not None}, total={total_ms:.0f}ms")
         logger.info("DB execution time ms=%s rows=%s", round(exec_ms, 2), row_count)
         log_event(
@@ -6137,8 +6353,21 @@ def handle_query(
             _update_session_query_state(session_state, cleaned_query, active_dialect, question=question)
             results = _results_to_records(df, places=2)
             timer.mark("results_formatting")
+            
+            # Log results formatting
+            log_event(logger, logging.INFO, "results_formatting_complete",
+                     result_rows=len(results),
+                     has_results=bool(results))
             cache_query_result(question, cleaned_query, df, query_cache, embedder, db=db)
+            log_event(logger, logging.INFO, "session_cache_add_complete",
+                     cache_scope="session",
+                     sql_length=len(cleaned_query),
+                     result_rows=len(df) if df is not None else 0)
             _GLOBAL_QUERY_CACHE.add(question, cleaned_query, df, embedder, db=db)
+            log_event(logger, logging.INFO, "cache_add_complete",
+                     cache_scope="global",
+                     sql_length=len(cleaned_query),
+                     result_rows=len(df) if df is not None else 0)
             turn = ConversationTurn(
                 question=question, sql=cleaned_query,
                 topic=_extract_query_topic(question, cleaned_query),

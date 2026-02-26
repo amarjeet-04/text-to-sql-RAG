@@ -203,8 +203,10 @@ class RAGEngine:
         k = self._effective_k(query, top_k)
         cache_key = self._cache_key(query, k, intent_key=intent_key)
 
-        # ### FAST RAG — TTL cache hit
+        # ### FAST RAG — TTL cache hit (minimal lock time)
         now = time.time()
+        
+        # Quick cache check with minimal lock time
         with self._cache_lock:
             cached = self._retrieve_cache.get(cache_key)
             if cached and (now - cached[0]) < self.CACHE_TTL:
@@ -214,9 +216,10 @@ class RAGEngine:
             if cached:
                 self._retrieve_cache.pop(cache_key, None)
 
+        # Do the expensive retrieval work outside the lock
         result = self._do_retrieve(query, k)
 
-        # Store in cache, evict oldest if over limit
+        # Store in cache, evict oldest if over limit (minimal lock time)
         with self._cache_lock:
             self._retrieve_cache[cache_key] = (now, result)
             self._retrieve_cache.move_to_end(cache_key)
