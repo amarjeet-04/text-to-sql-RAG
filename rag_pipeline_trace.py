@@ -385,7 +385,7 @@ def step3_build_prompt(question: str, rag_context: Dict, route_cfg: Dict) -> Dic
     schema_text = (
         "-- NOTE: abbreviated for trace — production uses full INFORMATION_SCHEMA dump.\n"
         "TABLE: BookingData  (PNRNo, AgentId, SupplierId, ProductCountryid,\n"
-        "                     BookingStatus, AgentBuyingPrice, CreatedDate, CheckInDate)\n"
+        "                     BookingStatus, AgentBuyingPrice, CompanyBuyingPrice, CreatedDate, CheckInDate)\n"
         "TABLE: AgentMaster_V1  (AgentId, AgentName, AgentType)\n"
         "TABLE: suppliermaster_Report  (EmployeeId, SupplierName)\n"
         "TABLE: Master_Country  (CountryID, Country)\n"
@@ -592,7 +592,7 @@ def main():
         ),
     )
     parser.add_argument("--question", "-q",
-        default="how our business is performing",
+        default="Show me monthly revenue and profit for each supplier over the last 6 months",
         help="Natural-language question to trace through the pipeline.")
     args     = parser.parse_args()
     question = args.question.strip()

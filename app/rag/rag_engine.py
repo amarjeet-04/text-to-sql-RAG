@@ -9,7 +9,7 @@ Optimisations vs. previous version:
   - Complex queries get top_k=4; simple ones get top_k=2
   - Class-level embedder singleton (loads once per process)
 """
-import re, os, hashlib, time, threading
+import re, os, hashlib, time, threading, pickle
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
 from collections import OrderedDict
@@ -81,22 +81,26 @@ class RAGEngine:
         if not enable_embeddings:
             return
 
-        # Reuse class-level cached embedder (saves ~2-3 s startup)
+        # Reuse class-level cached embedder (saves ~5 s startup within same process)
         if RAGEngine._cached_embedder and RAGEngine._cached_model_name == model_name:
             self.embedder = RAGEngine._cached_embedder
         else:
-            try:
-                self.embedder = HuggingFaceEmbeddings(
-                    model_name=model_name,
-                    model_kwargs={"device": "cpu"},
-                    encode_kwargs={"normalize_embeddings": True, "batch_size": 32},
-                )
-                RAGEngine._cached_embedder   = self.embedder
-                RAGEngine._cached_model_name = model_name
-                logger.info("Embedder loaded: %s", model_name)
-            except Exception:
-                logger.warning("Embedder unavailable — keyword fallback only", exc_info=True)
-                self.embedder = None
+            # Try loading the pickled embedder from disk (~23 ms vs ~5 s fresh load)
+            self.embedder = self._load_embedder_from_disk(model_name)
+            if self.embedder is None:
+                try:
+                    self.embedder = HuggingFaceEmbeddings(
+                        model_name=model_name,
+                        model_kwargs={"device": "cpu"},
+                        encode_kwargs={"normalize_embeddings": True, "batch_size": 32},
+                    )
+                    logger.info("Embedder loaded: %s", model_name)
+                    self._save_embedder_to_disk(self.embedder, model_name)
+                except Exception:
+                    logger.warning("Embedder unavailable — keyword fallback only", exc_info=True)
+                    self.embedder = None
+            RAGEngine._cached_embedder   = self.embedder
+            RAGEngine._cached_model_name = model_name
 
     # ------------------------------------------------------------------
     # Document ingestion helpers
@@ -142,8 +146,40 @@ class RAGEngine:
                                 {"term": term, "type": "synonym"}))
 
     # ------------------------------------------------------------------
-    # Index build
+    # Index build / persist / load
     # ------------------------------------------------------------------
+    _INDEX_PATH    = os.path.join(os.path.dirname(__file__), "faiss_index")
+    _EMBEDDER_PATH = os.path.join(os.path.dirname(__file__), "faiss_index", "embedder.pkl")
+
+    @classmethod
+    def _load_embedder_from_disk(cls, model_name: str) -> Optional[Any]:
+        """Load a pickled embedder (~23 ms) instead of re-initialising PyTorch (~5 s)."""
+        if not os.path.exists(cls._EMBEDDER_PATH):
+            return None
+        try:
+            with open(cls._EMBEDDER_PATH, "rb") as f:
+                emb = pickle.load(f)
+            # Validate it's still for the right model
+            if getattr(emb, "model_name", None) != model_name:
+                logger.info("Cached embedder is for a different model — ignoring")
+                return None
+            logger.info("Embedder loaded from disk pickle: %s", cls._EMBEDDER_PATH)
+            return emb
+        except Exception:
+            logger.warning("Embedder pickle load failed — will reload from HuggingFace", exc_info=True)
+            return None
+
+    @classmethod
+    def _save_embedder_to_disk(cls, embedder: Any, model_name: str) -> None:
+        """Pickle the embedder so future process starts skip the ~5 s PyTorch init."""
+        try:
+            os.makedirs(cls._INDEX_PATH, exist_ok=True)
+            with open(cls._EMBEDDER_PATH, "wb") as f:
+                pickle.dump(embedder, f)
+            logger.info("Embedder pickled to disk: %s", cls._EMBEDDER_PATH)
+        except Exception:
+            logger.warning("Embedder pickle save failed (non-fatal)", exc_info=True)
+
     def build_index(self):
         if not self.embedder or not self.documents:
             return
@@ -152,9 +188,31 @@ class RAGEngine:
         try:
             self.vector_store = FAISS.from_documents(lc_docs, self.embedder)
             logger.info("FAISS index built: %d docs", len(lc_docs))
+            try:
+                self.vector_store.save_local(self._INDEX_PATH)
+                logger.info("FAISS index saved to disk: %s", self._INDEX_PATH)
+            except Exception:
+                logger.warning("FAISS index save failed (non-fatal)", exc_info=True)
         except Exception:
             logger.warning("FAISS index build failed", exc_info=True)
             self.vector_store = None
+
+    def _load_index_from_disk(self) -> bool:
+        """Try to load a previously saved FAISS index. Returns True on success."""
+        if not self.embedder:
+            return False
+        index_file = os.path.join(self._INDEX_PATH, "index.faiss")
+        if not os.path.exists(index_file):
+            return False
+        try:
+            self.vector_store = FAISS.load_local(
+                self._INDEX_PATH, self.embedder, allow_dangerous_deserialization=True
+            )
+            logger.info("FAISS index loaded from disk: %s", self._INDEX_PATH)
+            return True
+        except Exception:
+            logger.warning("FAISS index load failed — will rebuild", exc_info=True)
+            return False
 
     # ------------------------------------------------------------------
     # ### FAST RAG — retrieval skip detection
@@ -204,12 +262,13 @@ class RAGEngine:
         cache_key = self._cache_key(query, k, intent_key=intent_key)
 
         # ### FAST RAG — TTL cache hit (minimal lock time)
-        now = time.time()
+        store_time = time.time()
+        
         
         # Quick cache check with minimal lock time
         with self._cache_lock:
             cached = self._retrieve_cache.get(cache_key)
-            if cached and (now - cached[0]) < self.CACHE_TTL:
+            if cached and (store_time - cached[0]) < self.CACHE_TTL:
                 self._retrieve_cache.move_to_end(cache_key)
                 log_event(logger, logging.INFO, "rag_cache_hit", cache_key=cache_key, top_k=k)
                 return cached[1]
@@ -221,7 +280,7 @@ class RAGEngine:
 
         # Store in cache, evict oldest if over limit (minimal lock time)
         with self._cache_lock:
-            self._retrieve_cache[cache_key] = (now, result)
+            self._retrieve_cache[cache_key] = (store_time, result)
             self._retrieve_cache.move_to_end(cache_key)
             while len(self._retrieve_cache) > self.CACHE_MAX:
                 self._retrieve_cache.popitem(last=False)
@@ -287,6 +346,7 @@ class RAGEngine:
     # ------------------------------------------------------------------
     def load_default_schema(self):
         """Load hard-coded domain examples so RAG has content on first boot."""
+        # Always populate self.documents (needed for keyword fallback and metadata).
         self.add_example(
             "show top 10 agents by revenue",
             "WITH AM AS (SELECT DISTINCT AgentId, AgentName FROM dbo.AgentMaster_V1 WITH (NOLOCK)) "
@@ -328,4 +388,6 @@ class RAGEngine:
             "Lookup tables (AgentMaster_V1, suppliermaster_Report, Master_Country, Master_City) "
             "have duplicates. Always wrap in a CTE with SELECT DISTINCT before joining.",
         )
-        self.build_index()
+        # Try loading the persisted index first; only rebuild (and re-save) if missing.
+        if not self._load_index_from_disk():
+            self.build_index()

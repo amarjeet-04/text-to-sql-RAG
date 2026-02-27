@@ -443,6 +443,7 @@ class StepTimer:
         "sql_generation",
         "sql_validation",
         "guardrails_applied",
+        "dry_run_validation",
         "db_execution",
         "results_formatting",
         "total",
@@ -1278,6 +1279,35 @@ def build_domain_digest(raw_text: str) -> str:
         cache["guidance"] = digest
         cache["raw_text"] = sql_text
     return digest
+
+
+def _get_stored_procedure_guidance() -> str:
+    """Return the cached domain digest without re-reading or re-hashing the file.
+
+    Hot path (file unchanged):
+      1. Lock → check mtime_ns matches stat() → return cached digest.
+      stat() is a single kernel call (~1 µs); no file read, no hash, no regex.
+
+    Cold/stale path (first call or file changed):
+      Falls back to _read_stored_procedure_file() + build_domain_digest().
+    """
+    cache = _STORED_PROCEDURE_CACHE
+    path = Path(cache.get("path") or str(STORED_PROCEDURE_FILE))
+    try:
+        mtime_ns = int(path.stat().st_mtime_ns)
+    except Exception:
+        mtime_ns = None
+
+    with _STORED_PROCEDURE_CACHE_LOCK:
+        if (
+            mtime_ns is not None
+            and cache.get("mtime_ns") == mtime_ns
+            and cache.get("domain_digest") is not None
+        ):
+            return cache["domain_digest"]
+
+    # Cache miss or file changed — do the full read + digest.
+    return build_domain_digest(_read_stored_procedure_file(path))
 
 
 def _add_stored_procedure_knowledge_to_rag(rag_engine: Optional[RAGEngine], raw_text: str):
@@ -3021,7 +3051,7 @@ def _rewrite_format_to_monthstart(sql: str, question: str = "") -> str:
 
     rewritten = pattern.sub(repl, sql)
     rewritten = re.sub(
-        r"(?i)AS\s+\[?(month|monthname|month_key)\]?",
+        r"(?i)AS\s+\[?(month|monthname|month_key)\]?(?!\w)",
         "AS [MonthStart]",
         rewritten,
     )
@@ -3386,6 +3416,11 @@ def _clean_sql_response(sql: str) -> str:
         cleaned = cleaned[start_match.start():].strip()
 
     cleaned = cleaned.replace("```", "").strip()
+
+    # Fix malformed bracketed aliases e.g. AS [MonthStart]Start] or AS [MonthStart]Start
+    # Anchored to AS so [dbo].[Table] and NOT IN ([a], [b]) are never touched.
+    cleaned = re.sub(r"(?i)(AS\s+)(\[[^\]]+\])([^\s,\n\r\)]+)", r"\1\2", cleaned)
+
     return cleaned
 
 
@@ -4748,7 +4783,7 @@ def initialize_connection(
         override = inputs.get("stored_procedure_guidance_override")
         if override is not None:
             return override
-        return build_domain_digest(_read_stored_procedure_file())
+        return _get_stored_procedure_guidance()
 
     # HTTP request timeout slightly above the thread-pool SLA so the HTTP layer
     # doesn't outlive the timeout gate and leak idle sockets.
@@ -4795,6 +4830,15 @@ def initialize_connection(
         schema_info = get_views_and_tables(db)
         tables_count = len(schema_info.get("tables", []))
         views_count = len(schema_info.get("views", []))
+
+    # Warm schema profile cache in background so the first query doesn't pay the
+    # INFORMATION_SCHEMA round-trip (~2-3s on remote DBs) during guardrail evaluation.
+    def _warm_schema_profile():
+        try:
+            _get_schema_profile(db)
+        except Exception:
+            pass
+    threading.Thread(target=_warm_schema_profile, daemon=True).start()
 
     message = (
         f"Connected! Using {llm_provider} ({model}). "
@@ -5096,6 +5140,11 @@ def _score_table_relevance(
         score += 5
     if "city" in question_tokens and "city" in table_name:
         score += 5
+    # "nationalities" stem-matches nationality/country tables
+    if any(t in question_tokens for t in ("nationality", "nationalities")) and any(
+        w in table_name for w in ("nationality", "country", "master")
+    ):
+        score += 6
     if preferred_tables and table_name in preferred_tables:
         score += 20
     if preferred_tables and table_entry.get("table", "").lower() in preferred_tables:
@@ -5125,6 +5174,17 @@ def _build_relevant_schema_only(question: str, db: Optional[SQLDatabase], fallba
         return (fallback_schema_text or "")[:6000]
 
     q_tokens = set(re.findall(r"[a-z0-9_]+", (question or "").lower()))
+    # Stem plural forms so "nationalities" matches columns/tables containing "nationality"
+    if "nationalities" in q_tokens:
+        q_tokens.add("nationality")
+    if "countries" in q_tokens:
+        q_tokens.add("country")
+    if "cities" in q_tokens:
+        q_tokens.add("city")
+    if "agents" in q_tokens:
+        q_tokens.add("agent")
+    if "suppliers" in q_tokens:
+        q_tokens.add("supplier")
     preferred_tables: set = set()
     state_last_table = (getattr(db, "_state_last_table_hint", None) or "").strip().lower() if db is not None else ""
     if state_last_table:
@@ -5158,6 +5218,7 @@ def _build_relevant_schema_only(question: str, db: Optional[SQLDatabase], fallba
         "createddate", "bookingdate", "booking_date", "checkindate", "checkoutdate",
         "bookingstatus", "pnrno", "agentid", "supplierid", "productname",
         "agentbuyingprice", "companybuyingprice", "productcountryid", "productcityid",
+        "nationality", "nationalityid", "countryid", "country",
     }
     snippets = []
     for _, entry in ranked[:4]:
@@ -5517,6 +5578,21 @@ def handle_query(
     dialect_label = _dialect_label(active_dialect)
     relative_date_reference = _build_relative_date_reference()
     nolock_setting = str(bool(enable_nolock)).lower()
+    # Resolve table names from the in-process schema profile cache when warm (0ms),
+    # falling back to db.get_usable_table_names() only on cold start (first ever request).
+    # The cache is populated by the background warm-up thread in initialize_connection.
+    if db is not None:
+        _cache_key = id(db._engine) if getattr(db, "_engine", None) is not None else None
+        _cached_profile = None
+        if _cache_key is not None:
+            with _SCHEMA_RUNTIME_LOCK:
+                _cached_profile = _SCHEMA_PROFILE_CACHE.get(_cache_key)
+        if _cached_profile is not None:
+            _usable_table_names: List[str] = [e["table"] for e in _cached_profile.get("tables", [])]
+        else:
+            _usable_table_names = list(db.get_usable_table_names())
+    else:
+        _usable_table_names: List[str] = []
     log_event(
         logger,
         logging.INFO,
@@ -5584,8 +5660,13 @@ def handle_query(
             # Short follow-ups in a data session ("what about India?", "only last week") are
             # almost always data queries — skip LLM intent detection for speed.
             intent = "DATA_QUERY"
+        elif len(re.findall(r"[A-Za-z0-9_]+", question or "")) >= 4:
+            # In a data chatbot, any substantive message (4+ words) that wasn't classified
+            # as conversational by detect_intent_simple is almost certainly a data query.
+            # Skip the LLM intent-detection call entirely.
+            intent = "DATA_QUERY"
         else:
-            schema_summary = ", ".join(db.get_usable_table_names()) if db else ""
+            schema_summary = ", ".join(_usable_table_names)
             intent = detect_intent_llm(question, schema_summary, llm, conversation_context)
     intent_duration = (time.perf_counter() - t_intent) * 1000
     logger.info(f"Intent detected: {intent} ({intent_duration:.0f}ms) | Q: {question[:80]}")
@@ -5601,7 +5682,7 @@ def handle_query(
 
     # Step 2: Handle non-data-query intents
     if intent in {"GREETING", "THANKS", "HELP", "FAREWELL", "OUT_OF_SCOPE", "CLARIFICATION_NEEDED"}:
-        tables = ", ".join(db.get_usable_table_names()) if db else "none"
+        tables = ", ".join(_usable_table_names) if _usable_table_names else "none"
         history = conversation_context[-500:] if conversation_context else "none"
         response = generate_conversational_response(question, intent, tables, history, llm)
         return _finalize_result({
@@ -5621,10 +5702,10 @@ def handle_query(
 
     @timed_step(timer, "stored_procedure_guidance")
     def _load_stored_proc_guidance():
-        return build_domain_digest(_read_stored_procedure_file())
+        return _get_stored_procedure_guidance()
 
-    full_schema_text = _load_schema()
-    stored_procedure_guidance = _load_stored_proc_guidance()
+    # Lazy-loaded inside the LLM-generation path (elif cleaned_query is None).
+    # Cache hits, deterministic topN/overview, and sort/filter follow-ups never pay this cost.
 
     # Step 3: Check for sort/filter follow-up
     previous_sql = _get_last_sql(chat_history) or session_state.get("last_sql")
@@ -5632,6 +5713,7 @@ def handle_query(
 
     cleaned_query = None
     is_valid = False
+    _sql_is_deterministic = False   # True when SQL was built by code, not LLM → skip dry-run
     skip_rag_retrieval = True  # default True; set to computed value only on the LLM path
     llm_retry_budget = 1
 
@@ -5669,6 +5751,7 @@ def handle_query(
         if overview_source is not None:
             cleaned_query = build_business_overview_sql_from_source(overview_source, date_scope=date_scope)
             is_valid = True
+            _sql_is_deterministic = True
             # Skip the rest of SQL generation logic and execute below.
             is_sort_request = False
             is_filter_mod = False
@@ -5682,6 +5765,7 @@ def handle_query(
         # For bare follow-ups like "give me top 10", this reuses previous SQL context.
         cleaned_query = topn_fallback_sql
         is_valid = True
+        _sql_is_deterministic = True
         is_sort_request = False
         is_filter_mod = False
     else:
@@ -5705,6 +5789,11 @@ def handle_query(
         is_valid = True
         is_followup_filter = True
     elif cleaned_query is None:
+        # Lazy-load schema + stored-proc guidance only on the LLM-generation path.
+        # Cache hits, deterministic builders, and sort/filter follow-ups exit before here.
+        full_schema_text = _load_schema()
+        stored_procedure_guidance = _load_stored_proc_guidance()
+
         ### FAST PATH: skip cache lookups for follow-up/time-sensitive prompts.
         is_followup = is_followup_question(question)
         cache_bypassed = is_followup or is_time_sensitive(question=question, sql="")
@@ -5721,24 +5810,9 @@ def handle_query(
             or q_word_count < 7
         )
         
-        if rag_engine and not skip_rag_retrieval and not cache_bypassed:
-            # Start RAG retrieval in background while we check cache
-            try:
-                rag_future = submit_background_task(
-                    rag_engine.retrieve,
-                    question,
-                    top_k=2,
-                    fast_mode=True,
-                    skip_for_followup=False,
-                    intent_key=_extract_query_topic(question, previous_sql or ""),
-                )
-                log_event(logger, logging.INFO, "rag_retrieval_started_background",
-                         q_word_count=q_word_count,
-                         skip_reason="none")
-            except Exception:
-                logger.warning("Failed to start background RAG retrieval", exc_info=True)
-                rag_future = None
-        
+        # RAG retrieval is ~10-40ms with disk cache — run inline, no async overhead.
+        rag_future = None
+
         if cache_bypassed:
             cached_sql, cached_df = None, None
             log_event(
@@ -5762,13 +5836,6 @@ def handle_query(
                      cache_hit=bool(cached_sql),
                      question_length=len(question or ""))
             
-            # If cache hit, we can cancel the RAG future if it exists
-            if cached_sql is not None and rag_future:
-                try:
-                    rag_future.cancel()
-                    log_event(logger, logging.INFO, "rag_retrieval_cancelled", reason="cache_hit")
-                except Exception:
-                    pass  # Best effort cancellation
         
         timer.mark("cache_lookup")
         if cached_sql is not None:
@@ -5809,38 +5876,16 @@ def handle_query(
             log_event(logger, logging.INFO, "query_cache_miss", scope="global_and_session")
             # Mark cache lookup stage even on miss to ensure proper timing
             timer.mark("cache_lookup")
-            
-            # Use singleflight to prevent duplicate RAG retrieval for identical questions
-            rag_cache_key = f"rag_retrieve:{question}:{_extract_query_topic(question, previous_sql or '')}:2"
-            
-            # Wait for RAG retrieval if it was started, or start it now if not
-            if rag_future:
-                try:
-                    rag_context = rag_future.result(timeout=2.0)  # 2 second timeout
-                    log_event(logger, logging.INFO, "rag_retrieval_completed",
-                             retrieval_time_ms=2000,  # Max time we waited
-                             has_results=bool(rag_context))
-                except FuturesTimeoutError:
-                    log_event(logger, logging.WARNING, "rag_retrieval_timeout", timeout_ms=2000)
-                    # Fallback to singleflight RAG retrieval
-                    rag_context = singleflight(rag_cache_key, rag_engine.retrieve,
-                                              question, top_k=2, fast_mode=True,
-                                              skip_for_followup=False,
-                                              intent_key=_extract_query_topic(question, previous_sql or ""))
-                except Exception as e:
-                    logger.warning("Background RAG retrieval failed", exc_info=True)
-                    log_event(logger, logging.WARNING, "rag_retrieval_error", error=str(e))
-                    # Fallback to singleflight RAG retrieval
-                    rag_context = singleflight(rag_cache_key, rag_engine.retrieve,
-                                              question, top_k=2, fast_mode=True,
-                                              skip_for_followup=False,
-                                              intent_key=_extract_query_topic(question, previous_sql or ""))
-            else:
-                # Use singleflight to prevent concurrent RAG retrievals
+
+            # RAG retrieval — only when the question actually needs schema examples.
+            # skip_rag_retrieval is True for follow-ups, short queries, sort/filter mods, etc.
+            rag_context: Dict[str, Any] = {"examples": [], "tables": [], "rules": [], "skipped": True}
+            if rag_engine and not skip_rag_retrieval and not cache_bypassed:
+                rag_cache_key = f"rag_retrieve:{question}:{_extract_query_topic(question, previous_sql or '')}:2"
                 rag_context = singleflight(rag_cache_key, rag_engine.retrieve,
-                                          question, top_k=2, fast_mode=True,
-                                          skip_for_followup=False,
-                                          intent_key=_extract_query_topic(question, previous_sql or ""))
+                                           question, top_k=2, fast_mode=True,
+                                           skip_for_followup=False,
+                                           intent_key=_extract_query_topic(question, previous_sql or ""))
 
         # CHANGED: structured state is primary prompt memory; raw text is secondary.
         prompt_context = _build_prompt_context_from_state(session_state, conversation_context, conversation_turns)
@@ -6035,7 +6080,7 @@ def handle_query(
                         use_reasoning=use_reasoning,
                         query_complexity=_query_complexity if '_query_complexity' in locals() else 'unknown')
 
-                if is_valid and ENABLE_SQL_VALIDATOR:
+                if is_valid and ENABLE_SQL_VALIDATOR and _query_complexity == "complex_llm":
                     validator_context = {
                         "tables": rag_context.get("tables", []),
                         "examples": (rag_context.get("examples", []) or [])[:2],
@@ -6157,6 +6202,11 @@ def handle_query(
                         except Exception:
                             logger.warning("ID-column LLM fix failed, keeping original", exc_info=True)
 
+            # Final mark: captures retry LLM call + top-N guardrail + ID-column fix.
+            # Without this, all that time falls in the gap between sql_validation and
+            # guardrails_applied and shows as "unaccounted" in the timing table.
+            timer.mark("sql_validation")
+
             if not is_valid:
                 return _finalize_result(_make_error_result(
                     "Could not generate valid SQL", session_state,
@@ -6210,19 +6260,25 @@ def handle_query(
         else:
             log_event(logger, logging.DEBUG, "no_guardrails_applied")
 
-        # Adjust timeout based on query complexity
+        # Adjust timeout based on query complexity (reuse already-computed _query_complexity)
         base_timeout = getattr(db_config, "query_timeout", 30)
-        complexity = _estimate_query_complexity(question)
-        if complexity == "complex_llm":
+        if _query_complexity == "complex_llm":
             timeout_seconds = max(base_timeout, 60)
-        elif complexity == "simple_llm":
+        elif _query_complexity == "simple_llm":
             timeout_seconds = min(base_timeout, 20)
         else:
             timeout_seconds = base_timeout
-        logger.info(f"Query complexity: {complexity}, timeout: {timeout_seconds}s")
+        logger.info(f"Query complexity: {_query_complexity}, timeout: {timeout_seconds}s")
 
-        # Dry-run validation: catch column/table errors before actual execution
-        dry_ok, dry_err = validate_sql_dry_run(db, cleaned_query)
+        # Dry-run validation: only for LLM-generated complex SQL.
+        # Skip for: deterministic builders, topN/overview templates, simple_llm that passed
+        # static validation — these don't hallucinate column names so the extra DB round-trip
+        # is wasted latency (~3-4s per query).
+        _skip_dry_run = (
+            _sql_is_deterministic
+            or _query_complexity in ("deterministic", "simple_llm")
+        )
+        dry_ok, dry_err = (True, None) if _skip_dry_run else validate_sql_dry_run(db, cleaned_query)
         if not dry_ok:
             logger.warning(f"SQL dry-run failed: {dry_err}")
             cleaned_query = fix_common_sql_errors(cleaned_query, dialect=active_dialect)
@@ -6269,6 +6325,7 @@ def handle_query(
                 except Exception:
                     logger.warning("LLM fix after dry-run failed", exc_info=True)
 
+        timer.mark("dry_run_validation")
         t_exec = time.perf_counter()
         df, error = execute_query_safe(db, cleaned_query, timeout_seconds=timeout_seconds, max_rows=500)
         exec_ms = (time.perf_counter() - t_exec) * 1000
@@ -6322,11 +6379,8 @@ def handle_query(
                     question,
                     previous_sql,
                     db,
-                    db_config,
-                    llm,
                     query_cache,
                     embedder,
-                    conversation_context,
                     timeout_seconds,
                     sql_dialect=active_dialect,
                     enable_nolock=enable_nolock,
@@ -6386,11 +6440,8 @@ def handle_query(
                 question,
                 previous_sql,
                 db,
-                db_config,
-                llm,
                 query_cache,
                 embedder,
-                conversation_context,
                 timeout_seconds,
                 sql_dialect=active_dialect,
                 enable_nolock=enable_nolock,
@@ -6402,6 +6453,7 @@ def handle_query(
                     active_dialect,
                     question=question,
                 )
+                retry_result["updated_state"] = session_state
                 return _finalize_result(retry_result)
             # Both attempts returned nothing
             _update_session_query_state(session_state, cleaned_query, active_dialect, question=question)
@@ -6435,34 +6487,57 @@ def handle_query(
     # Should not reach here
     return _finalize_result(_make_error_result("Unexpected error processing query", session_state))
 
+# def _get_last_sql(chat_history: List[Dict]) -> Optional[str]:
+#     for chat in reversed(chat_history):
+#         if chat.get("sql") and chat["sql"].strip().upper().startswith("SELECT"):
+#             return chat["sql"]
+#     return None
 
 def _get_last_sql(chat_history: List[Dict]) -> Optional[str]:
-    for chat in reversed(chat_history):
-        if chat.get("sql") and chat["sql"].strip().upper().startswith("SELECT"):
-            return chat["sql"]
+    for chat in reversed(chat_history[-5:]):  # only last 5
+        sql = chat.get("sql")
+        if sql and sql.lstrip().upper().startswith("SELECT"):
+            return sql
     return None
 
+
+# def _get_last_result_df(chat_history: List[Dict]):
+#     for chat in reversed(chat_history):
+#         if chat.get("result_df") is not None:
+#             return chat["result_df"]
+#         # New format: result_rows is a list[dict] (no pandas in chat hot path)
+#         rows = chat.get("result_rows")
+#         if rows:
+#             try:
+#                 return pd.DataFrame(rows)
+#             except Exception:
+#                 pass
+#     return None
 
 def _get_last_result_df(chat_history: List[Dict]):
-    for chat in reversed(chat_history):
-        if chat.get("result_df") is not None:
-            return chat["result_df"]
-        # New format: result_rows is a list[dict] (no pandas in chat hot path)
+    for chat in reversed(chat_history[-5:]):  # only recent
+        df = chat.get("result_df")
+        if df is not None:
+            return df
+
         rows = chat.get("result_rows")
         if rows:
-            try:
+            # Only convert small sets
+            if len(rows) <= 1000:
                 return pd.DataFrame(rows)
-            except Exception:
-                pass
+            return None
+
     return None
 
 
-def _get_previous_topic(chat_history: List[Dict]) -> str:
-    """Get the previous question for context in retry."""
-    for chat in reversed(chat_history):
-        if chat.get("question"):
-            return chat["question"]
-    return "bookings"
+# def _get_previous_topic(chat_history: List[Dict]) -> str:
+#     """Get the previous question for context in retry."""
+#     for chat in reversed(chat_history):
+#         if chat.get("question"):
+#             return chat["question"]
+#     return "bookings"
+
+
 
 
 def _extract_search_term(question: str) -> Optional[str]:
@@ -6518,11 +6593,8 @@ def _retry_followup_across_views(
     question: str,
     previous_sql: str,
     db,
-    db_config,
-    llm,
     query_cache: Any,
     embedder,
-    conversation_context: str,
     timeout_seconds: int,
     sql_dialect: str = DEFAULT_SQL_DIALECT,
     enable_nolock: bool = False,
@@ -6572,7 +6644,7 @@ def _retry_followup_across_views(
                     "row_count": len(results),
                     "from_cache": False,
                     "error": None,
-                    "updated_state": session_state,
+                    "updated_state": None,  # caller must set session_state
                     "nl_pending": True,
                 }
         except Exception:
