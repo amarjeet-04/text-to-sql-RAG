@@ -39,6 +39,8 @@ FIXED_SCHEMA = (
     "TABLE: Master_Country  (CountryID, Country)\n"
     "TABLE: Master_City     (CityID, City, CountryID)\n"
     "TABLE: Hotelchain      (HotelId, HotelName, Country, City, Star, Chain)\n"
+    "Table: AgentTypeMapping (AgentId, agenttype)\n"
+
 )
 
 
@@ -145,12 +147,6 @@ MINIMAL_RULES = (
     "    THEN BD.PNRNo\n"
     "  END)\n"
     "--------------------------------------------------------------\n"
-"### QUERY SHAPE RULES\n"
-    "• GROUP BY only dimension columns.\n"
-    "• If user asks TOP/BEST: use TOP(N) + ORDER BY metric DESC.\n"
-    "• If user asks OVERALL KPI: do NOT add ORDER BY.\n"
-    "• Detail list queries must use TOP(200).\n"
-    "• Prefer aggregated queries over row-level queries.\n"
 )
 
 
