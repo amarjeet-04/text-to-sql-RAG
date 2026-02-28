@@ -147,6 +147,14 @@ MINIMAL_RULES = (
     "    THEN BD.PNRNo\n"
     "  END)\n"
     "--------------------------------------------------------------\n"
+    "### TEXT FILTER RULES (HARD)\n"
+    "• For name-based filters (AgentName, SupplierName, HotelName, ProductName, Country, City):\n"
+    "  - Default MUST be PREFIX match (index-friendly): col LIKE 'term%'\n"
+    "  - DO NOT use leading wildcard by default: col LIKE '%term%'\n"
+    "  - Use '%term%' ONLY if user explicitly asks: contains / match anywhere / partial anywhere / includes / similar\n"
+    "• If term contains a single quote, escape it (SQL): replace ' with ''\n"
+    "• Optional (only if your DB collation is case-sensitive): LOWER(col) LIKE 'term%'\n"
+    "\n"
 )
 
 
@@ -295,10 +303,10 @@ def _run_pipeline(
     rag_hints  = [t["table"] if isinstance(t, dict) else str(t) for t in raw_tables if t]
     retrieved_tables_hint = ", ".join(rag_hints[:6]) if rag_hints else "none"
 
-    # conversation context — last 3 Q+SQL turns
+    # conversation context — last  4+SQL turns
     if conversation_turns:
         ctx_lines = []
-        for turn in conversation_turns[-3:]:
+        for turn in conversation_turns[-4:]:
             q_prev = turn.get("question", "")
             s_prev = turn.get("sql", "")
             if q_prev:
@@ -311,10 +319,14 @@ def _run_pipeline(
 
     # business rules — RAG rules when available, else MINIMAL_RULES fallback
     rag_rules = rag_context.get("rules") or []
-    stored_guidance = (
-        "\n".join(r.get("content", r.get("name", "")) for r in rag_rules)
-        if rag_rules else MINIMAL_RULES
-    )
+    # stored_guidance = (
+    #     "\n".join(r.get("content", r.get("name", "")) for r in rag_rules)
+    #     if rag_rules else MINIMAL_RULES
+    # )
+    stored_guidance = MINIMAL_RULES
+    if rag_rules:
+        extra = "\n".join(r.get("content", r.get("name", "")) for r in rag_rules)
+        stored_guidance = f"{MINIMAL_RULES}\n### ADDITIONAL RETRIEVED RULES\n{extra}"
 
     prompt_vars = dict(
         dialect_label             = dial_label,
@@ -342,7 +354,7 @@ def _run_pipeline(
             from langchain_core.output_parsers import StrOutputParser
             simple_model = os.getenv("LLM_MODEL_SIMPLE", "gpt-4o-mini")
             simple_llm   = ChatOpenAI(
-                model=simple_model, temperature=0,
+                model=simple_model, temperature=0.0,
                 openai_api_key=api_key, request_timeout=30,
             )
             chain = (

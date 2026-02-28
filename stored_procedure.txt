@@ -1,244 +1,137 @@
-1. supplier level sql:
-with AM as(select distinct employeeid,suppliername from [MIS_Report_Data].[dbo].[suppliermaster_Report] with (nolock))
-,
-main as(
-select distinct BD.supplierid,AM.employeeid,AM.suppliername,
-cast(createddate as date) as booking_date,cast(checkindate as date) as checkin_date,cast(checkoutdate as date) as checkout_date,sum(agentbuyingprice) as total_sales,sum(agentbuyingprice - companybuyingprice) as total_profit
-,count(distinct pnrno) as total_booking
-from dbo.BookingData BD with (nolock)
-left join AM
-on AM.employeeid = BD.supplierid
-where cast(CreatedDate as date) >= '2025-01-01 00:00:00.000'
-and bookingstatus not in ('Cancelled','Not Confirmed','On Request')
-group by BD.supplierid,AM.employeeid,AM.suppliername,
-cast(createddate as date),cast(checkindate as date) ,cast(checkoutdate as date))
-select * from main
+### BASE TABLE RULE
+• Always use BookingData as the base table.
+• All queries must start FROM BookingData BD.
+• Dimension tables must be LEFT JOINed to BookingData.
+• Never start FROM AgentMaster_V1, Master_Country, Master_City, or Supplier tables.
+
+• Only JOIN a dimension table if the user's question explicitly mentions:
+  - agent / client / travel agent → then join AgentMaster_V1
+  - supplier / vendor            → then join suppliermaster_Report
+  - hotel / property             → then join Hotelchain
+  - country                      → then join Master_Country
+  - city                         → then join Master_City
+  If the question only asks for revenue, profit, or bookings with no dimension breakdowns, use BookingData alone.
 
 
-2. Agent type level sql:
-with AM as(SELECT distinct agentid,agentname,agenttype from [MIS_Report_Data].[dbo].AgentTypeMapping),
-AMV as (select distinct AgentId,AgentCode,AgentName from [MIS_Report_Data].[dbo].[AgentMaster_V1]),
-ag_type as(
-select distinct
-case when AMV.agentcode = 'WEGR' then 'We Groups' else
-AM.agenttype end as agenttype,
-count(distinct pnrno) total_bookings
-from dbo.BookingData BD with (nolock)
-left join AM on AM.agentid = BD.agentid
-left join AMV on AMV.agentid = BD.agentid
-where cast(CreatedDate as date) >= '2025-01-01 00:00:00.000'
-and bookingstatus not in ('Cancelled','Not Confirmed','On Request')
-group by AMV.agentcode, AM.agenttype
-)
-select distinct agenttype, sum(total_bookings) as total_bookings
-from ag_type
-group by agenttype
+Example — revenue/profit/bookings only (no dimension mentioned):
+FROM BookingData BD
 
- 
-3. country level sql:
-with AM as(select distinct CountryID,Country from [MIS_Report_Data].[dbo].[Master_Country] with (nolock))
-,
-main as(
-select distinct BD.ProductCountryid,AM.CountryID,AM.Country,
-cast(createddate as date) as booking_date,cast(checkindate as date) as checkin_date,cast(checkoutdate as date) as checkout_date,sum(agentbuyingprice) as total_sales,sum(agentbuyingprice - companybuyingprice) as total_profit
-,count(distinct pnrno) as total_booking
-from dbo.BookingData BD with (nolock)
-left join AM
-on AM.CountryID = BD.ProductCountryid
-where cast(CreatedDate as date) >= '2025-01-01 00:00:00.000'
-and bookingstatus not in ('Cancelled','Not Confirmed','On Request')
-group by BD.ProductCountryid,AM.CountryID,AM.Country,
-cast(createddate as date),cast(checkindate as date) ,cast(checkoutdate as date))
-select * from main
+Example — when agent or client is mentioned:
+FROM BookingData BD
+LEFT JOIN dbo.AgentMaster_V1 A ON BD.AgentId = A.AgentId
 
+Example — when supplier is mentioned:
+FROM BookingData BD
+LEFT JOIN dbo.suppliermaster_Report SM ON BD.SupplierId = SM.EmployeeId
 
-4. city level sql:
- 
-with AM as(select distinct [CityId],City from [MIS_Report_Data].[dbo].[Master_City] with (nolock))
-,
-main as(
-select distinct BD.[ProductCityId],AM.CityID,AM.City,
-cast(createddate as date) as booking_date,cast(checkindate as date) as checkin_date,cast(checkoutdate as date) as checkout_date,sum(agentbuyingprice) as total_sales,sum(agentbuyingprice - companybuyingprice) as total_profit
-,count(distinct pnrno) as total_booking
-from dbo.BookingData BD with (nolock)
-left join AM
-on AM.[CityId] = BD.[ProductCityId]
-where cast(CreatedDate as date) >= '2025-01-01 00:00:00.000'
-and bookingstatus not in ('Cancelled','Not Confirmed','On Request')
-group by BD.[ProductCityId],AM.[CityId],AM.City,
-cast(createddate as date),cast(checkindate as date) ,cast(checkoutdate as date))
-select * from main
+### GLOBAL FILTERS
+• Default KPI filter:
+  BD.BookingStatus NOT IN ('Cancelled','Not Confirmed','On Request')
+• Exception:
+  Total Cancelled Bookings uses BookingStatus = 'Cancelled'
 
+### DATE FILTER RULES
+• Never use CAST(date_col AS DATE) in WHERE.
+• Always use SARGable ranges:
+  BD.CreatedDate >= 'YYYY-MM-DD'
+  AND BD.CreatedDate < 'YYYY-MM-DD'
+• If the user does NOT mention any time period, do NOT add a date filter.
+• Only add a date filter when the user explicitly mentions a year, month, period, or uses words like "this year", "last month", "YTD", "2024", etc.
 
-5. client nationality level:
-select distinct BD.ClientNatinality,
-cast(createddate as date) as booking_date,cast(checkindate as date) as checkin_date,cast(checkoutdate as date) as checkout_date,sum(agentbuyingprice) as total_sales,sum(agentbuyingprice - companybuyingprice) as total_profit
-,count(distinct pnrno) as total_booking
-from dbo.BookingData BD with (nolock)
-where cast(CreatedDate as date) >= '2025-01-01 00:00:00.000'
-and bookingstatus not in ('Cancelled','Not Confirmed','On Request')
---and ClientNatinality = 'united states'
---and cast(createddate as date) = '2026-01-03'
-group by BD.ClientNatinality,
-cast(createddate as date),cast(checkindate as date) ,cast(checkoutdate as date)
+### DUPLICATE PREVENTION
+• Lookup tables may contain duplicates.
+• Use DISTINCT mapping if needed:
+  WITH AM AS (
+    SELECT DISTINCT AgentId, AgentName
+    FROM AgentMaster_V1
+  )
 
-6. hotel level sql:
- 
-select distinct BD.productname,
-cast(createddate as date) as booking_date,cast(checkindate as date) as checkin_date,cast(checkoutdate as date) as checkout_date,sum(agentbuyingprice) as total_sales,sum(agentbuyingprice - companybuyingprice) as total_profit
-,count(distinct pnrno) as total_booking
-from dbo.BookingData BD with (nolock)
-where cast(CreatedDate as date) >= '2025-01-01 00:00:00.000'
-and bookingstatus not in ('Cancelled','Not Confirmed','On Request')
---and productname = 'indonesia'
---and cast(createddate as date) = '2026-01-03'
-group by BD.productname,
-cast(createddate as date),cast(checkindate as date) ,cast(checkoutdate as date)
+### TERMINOLOGY MAP (business word → SQL column)
+• "client" / "agent" / "travel agent" / "B2B partner" → AgentMaster_V1.AgentName
+• "supplier" / "hotel supplier" / "vendor" → suppliermaster_Report.SupplierName
+• "hotel" / "property" → Hotelchain.HotelName
+• "country" → Master_Country.Country  (destination country)
+• "city" → Master_City.City
+• NEVER map "client" to BD.ClientNatinality, BD.Nationality, or any nationality column.
 
-8. hotel sales growth YTD vs PYTD sql:
-with main as (
-select distinct productname,
-SUM(CASE
-    WHEN cast(CreatedDate as date) >= DATEFROMPARTS(YEAR(GETDATE()), 1, 1)
-     AND cast(CreatedDate as date) <= GETDATE()
-     and bookingstatus not in ('Cancelled','Not Confirmed','On Request')
-    THEN agentbuyingprice
-END) AS YTD_Sales,
-SUM(CASE
-    WHEN cast(CreatedDate as date) >= DATEFROMPARTS(YEAR(GETDATE()) - 1, 1, 1)
-     AND cast(CreatedDate as date) <= DATEADD(YEAR, -1, GETDATE())
-     and bookingstatus not in ('Cancelled','Not Confirmed','On Request')
-    THEN agentbuyingprice
-END) AS PYTD_Sales
-from dbo.BookingData BD with (nolock)
-where CreatedDate >= DATEFROMPARTS(YEAR(GETDATE())-1,1,1)
-  AND CreatedDate < DATEFROMPARTS(YEAR(GETDATE())+1,1,1)
-group by productname
-)
-SELECT TOP 15
-    productname,
-    YTD_Sales,
-    PYTD_Sales,
-    (YTD_Sales - PYTD_Sales) AS Growth_Amount,
-    CASE
-        WHEN YTD_Sales = 0 THEN NULL
-        ELSE (YTD_Sales - PYTD_Sales) * 100.0 / NULLIF(PYTD_Sales, 0)
-    END AS Growth_Percentage
-FROM main
-WHERE YTD_Sales IS NOT NULL
-ORDER BY Growth_Percentage DESC
+### AGENT DIMENSION RULES
+• JOIN AgentMaster ONLY when the question mentions agent / client / travel agent / B2B partner:
+  LEFT JOIN dbo.AgentMaster_V1 A ON BD.AgentId = A.AgentId
+• AgentName = A.AgentName
+• AgentCode = A.AgentCode
+• AgentType:
+  - Prefer AgentTypeMapping if available:
+    LEFT JOIN dbo.AgentTypeMapping ATM ON ATM.AgentId = BD.AgentId
+    AgentType = ATM.agenttype
+  - Special override: if A.AgentCode = 'WEGR' then AgentType = 'We Groups'
+  - Else AgentType = COALESCE(ATM.agenttype,'Unknown')
+• Never select BD.AgentId in final output.
 
+### SUPPLIER DIMENSION RULES
+• JOIN supplier ONLY when the question mentions supplier / vendor / hotel supplier:
+  LEFT JOIN dbo.suppliermaster_Report SM ON BD.SupplierId = SM.EmployeeId
+• SupplierName = SM.SupplierName
+• Filter by supplier name using PREFIX match: SM.SupplierName LIKE 'term%'
+• Never use exact = for SupplierName (stored names may be longer than user typed).
 
-9. supplier sales growth YTD vs PYTD sql:
-with AM as (select distinct employeeid, suppliername from [MIS_Report_Data].[dbo].[suppliermaster_Report] with (nolock)),
-main as (
-select distinct AM.suppliername,
-SUM(CASE
-    WHEN cast(BD.CreatedDate as date) >= DATEFROMPARTS(YEAR(GETDATE()), 1, 1)
-     AND cast(BD.CreatedDate as date) <= GETDATE()
-     and BD.bookingstatus not in ('Cancelled','Not Confirmed','On Request')
-    THEN BD.agentbuyingprice
-END) AS YTD_Sales,
-SUM(CASE
-    WHEN cast(BD.CreatedDate as date) >= DATEFROMPARTS(YEAR(GETDATE()) - 1, 1, 1)
-     AND cast(BD.CreatedDate as date) <= DATEADD(YEAR, -1, GETDATE())
-     and BD.bookingstatus not in ('Cancelled','Not Confirmed','On Request')
-    THEN BD.agentbuyingprice
-END) AS PYTD_Sales
-from dbo.BookingData BD with (nolock)
-left join AM on AM.employeeid = BD.supplierid
-where BD.CreatedDate >= DATEFROMPARTS(YEAR(GETDATE())-1,1,1)
-  AND BD.CreatedDate < DATEFROMPARTS(YEAR(GETDATE())+1,1,1)
-group by AM.suppliername
-)
-SELECT TOP 15
-    suppliername,
-    YTD_Sales,
-    PYTD_Sales,
-    (YTD_Sales - PYTD_Sales) AS Growth_Amount,
-    CASE
-        WHEN YTD_Sales = 0 THEN NULL
-        ELSE (YTD_Sales - PYTD_Sales) * 100.0 / NULLIF(PYTD_Sales, 0)
-    END AS Growth_Percentage
-FROM main
-WHERE YTD_Sales IS NOT NULL
-ORDER BY Growth_Percentage DESC
+### HOTEL DIMENSION RULES
+• DO NOT use BD.HotelChainId, HC.HotelChainId, HotelChainName, HotelChainId.
+• The ONLY allowed hotel join is:
+  LEFT JOIN dbo.Hotelchain HC ON BD.ProductId = HC.HotelId
+• Columns: HC.HotelName, HC.Country, HC.City, HC.Star
+• Chain bucket:
+  CASE
+    WHEN HC.chain IS NULL THEN 'No Chain Hotels'
+    WHEN HC.chain IN ('COURTYARD BY MARRIOTT','Marriott - Renaissance Hotels','Marriott','Marriott International') THEN 'Marriot Group'
+    WHEN HC.chain IN ('Hyatt Hotels Corporation','Hyatt Hotels') THEN 'Hyatt Group'
+    WHEN HC.chain IN ('Accor - Thalassa','Novotel Accor Hotels','Accor') THEN 'Accor Group'
+    WHEN HC.chain IN ('Best Western Hotels','Best Western Hotels & Resorts','Best Western') THEN 'Best Western Group'
+    WHEN HC.chain IN ('Kempinski Hotels & Resorts','Kempinski') THEN 'Kempinski Group'
+    WHEN HC.chain IN ('Four Seasons','Four Seasons Real Estate','Four Seasons Hotels and Resorts') THEN 'Four Seasons Group'
+    WHEN HC.chain IN ('Shangri-La Hotels and Resorts','Shangri-La Hotels - Traders Hotels') THEN 'Shangri-La Group'
+    ELSE HC.chain
+  END AS Chain
 
+### METRIC DEFINITIONS
+• Total Sales = SUM(COALESCE(BD.AgentBuyingPrice,0))
+• Total Cost  = SUM(COALESCE(BD.CompanyBuyingPrice,0))
+• Total Profit = SUM(COALESCE(BD.AgentBuyingPrice,0) - COALESCE(BD.CompanyBuyingPrice,0))
+• Total Booking Count = COUNT(DISTINCT BD.PNRNo)
 
-10. country sales growth YTD vs PYTD sql:
-with AM as (select distinct CountryID, Country from [MIS_Report_Data].[dbo].[Master_Country] with (nolock)),
-main as (
-select distinct AM.Country,
-SUM(CASE
-    WHEN cast(BD.CreatedDate as date) >= DATEFROMPARTS(YEAR(GETDATE()), 1, 1)
-     AND cast(BD.CreatedDate as date) <= GETDATE()
-     and BD.bookingstatus not in ('Cancelled','Not Confirmed','On Request')
-    THEN BD.agentbuyingprice
-END) AS YTD_Sales,
-SUM(CASE
-    WHEN cast(BD.CreatedDate as date) >= DATEFROMPARTS(YEAR(GETDATE()) - 1, 1, 1)
-     AND cast(BD.CreatedDate as date) <= DATEADD(YEAR, -1, GETDATE())
-     and BD.bookingstatus not in ('Cancelled','Not Confirmed','On Request')
-    THEN BD.agentbuyingprice
-END) AS PYTD_Sales
-from dbo.BookingData BD with (nolock)
-left join AM on AM.CountryID = BD.ProductCountryid
-where BD.CreatedDate >= DATEFROMPARTS(YEAR(GETDATE())-1,1,1)
-  AND BD.CreatedDate < DATEFROMPARTS(YEAR(GETDATE())+1,1,1)
-group by AM.Country
-)
-SELECT TOP 15
-    Country,
-    YTD_Sales,
-    PYTD_Sales,
-    (YTD_Sales - PYTD_Sales) AS Growth_Amount,
-    CASE
-        WHEN YTD_Sales = 0 THEN NULL
-        ELSE (YTD_Sales - PYTD_Sales) * 100.0 / NULLIF(PYTD_Sales, 0)
-    END AS Growth_Percentage
-FROM main
-WHERE YTD_Sales IS NOT NULL
-ORDER BY Growth_Percentage DESC
+• Avg Booking Value =
+  SUM(COALESCE(BD.AgentBuyingPrice,0))
+  / NULLIF(COUNT(DISTINCT BD.PNRNo),0)
 
+• Total Room Nights =
+  SUM(DATEDIFF(DAY, BD.CheckInDate, BD.CheckOutDate))
 
-7. hotel chain level sql:
-with AM as(select  
-distinct hotelid,hotelname,country,city,star,chain
-from [MIS_Report_Data].[dbo].[Hotelchain])
-,
-main as(
-select distinct BD.[ProductId],AM.hotelid,AM.hotelname,
-case when AM.chain is null then 'No Chain Hotels'
-when chain = 'COURTYARD BY MARRIOTT'
-or chain = 'Marriott - Renaissance Hotels'
-or chain = 'Marriott'
-or chain = 'Marriott International'
-then 'Marriot Group'
-when chain = 'Hyatt Hotels Corporation' or chain = 'Hyatt Hotels'
-then 'Hyatt Group'
-when chain = 'Accor - Thalassa' or chain = 'Novotel Accor Hotels'
-or chain = 'Accor'
-then 'Accor Group'
-when chain = 'Best Western Hotels' or chain = 'Best Western Hotels & Resorts'
-or chain = 'Best Western'
-then 'Best Western Group'
-when chain = 'Kempinski Hotels & Resorts' or chain = 'Kempinski'
-then 'Kempinski Group'
-when chain = 'Four Seasons' or chain = 'Four Seasons Real Estate'
-or chain = 'Four Seasons Hotels and Resorts'
-then 'Four Seasons Group'
-when chain = 'Shangri-La Hotels and Resorts' or chain = 'Shangri-La Hotels - Traders Hotels'
-then 'Shangri-La Group'
-else AM.chain end as chain,
-cast(createddate as date) as booking_date,cast(checkindate as date) as checkin_date,cast(checkoutdate as date) as checkout_date,sum(agentbuyingprice) as total_sales,sum(agentbuyingprice - companybuyingprice) as total_profit
-,count(distinct pnrno) as total_booking
-from dbo.BookingData BD with (nolock)
-left join AM
-on AM.hotelid = BD.[ProductId]
-where cast(CreatedDate as date) >= '2025-01-01 00:00:00.000'
-and bookingstatus not in ('Cancelled','Not Confirmed','On Request')
-group by BD.[ProductId],AM.hotelid,AM.hotelname,AM.chain,
-cast(createddate as date),cast(checkindate as date) ,cast(checkoutdate as date))
-select * from main
---where booking_date = '2026-01-03'
---and chain = 'Independent'
+• Avg Booking Window =
+  AVG(CAST(DATEDIFF(DAY, BD.CreatedDate, BD.CheckInDate) AS FLOAT))
+
+• Total Last Minute Bookings =
+  COUNT(DISTINCT CASE
+    WHEN DATEDIFF(DAY, BD.CreatedDate, BD.CheckInDate) <= 1
+    THEN BD.PNRNo
+  END)
+
+• Total Cancelled Bookings =
+  COUNT(DISTINCT CASE
+    WHEN BD.BookingStatus = 'Cancelled'
+    THEN BD.PNRNo
+  END)
+
+• Total Non Refundable Bookings =
+  COUNT(DISTINCT CASE
+    WHEN DATEDIFF(DAY, BD.CreatedDate, BD.CancellationDate) <= 0
+    THEN BD.PNRNo
+  END)
+
+--------------------------------------------------------------
+### TEXT FILTER RULES (HARD)
+• For name-based filters (AgentName, SupplierName, HotelName, ProductName, Country, City):
+  - Default MUST be PREFIX match (index-friendly): col LIKE 'term%'
+  - DO NOT use leading wildcard by default: col LIKE '%term%'
+  - Use '%term%' ONLY if user explicitly asks: contains / match anywhere / partial anywhere / includes / similar
+• If term contains a single quote, escape it (SQL): replace ' with ''
+• Optional (only if your DB collation is case-sensitive): LOWER(col) LIKE 'term%'
+

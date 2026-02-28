@@ -48,7 +48,7 @@ class ConnectRequest(BaseModel):
     query_timeout: int   = 30
     view_support:  bool  = True
     sql_dialect:   str   = "sqlserver"
-    enable_nolock: bool  = False
+    enable_nolock: bool  = True
 
 
 class ConnectResponse(BaseModel):
