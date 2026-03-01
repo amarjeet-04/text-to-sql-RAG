@@ -56,30 +56,37 @@ def _signup_user(username: str, password: str, role: str) -> bool:
     return True
 
 
-# ── query result cache (exact-match LRU + TTL) ────────────────────────────────
-_QUERY_CACHE: "OrderedDict[str, Dict]" = OrderedDict()
-_CACHE_TTL_S  = 300   # 5 minutes
-_CACHE_MAX    = 200
+# ── query result cache (exact-match LRU + TTL, stored in session_state) ──────
+# Stored in session_state so it survives Streamlit reruns reliably.
+_CACHE_TTL_S = 300   # 5 minutes
+_CACHE_MAX   = 200
 
 def _cache_key(question: str) -> str:
     return question.strip().lower()
 
+def _get_cache() -> "OrderedDict[str, Dict]":
+    if "_query_cache" not in st.session_state:
+        st.session_state._query_cache = OrderedDict()
+    return st.session_state._query_cache
+
 def _cache_get(question: str) -> Optional[Dict]:
-    key = _cache_key(question)
-    entry = _QUERY_CACHE.get(key)
+    cache = _get_cache()
+    key   = _cache_key(question)
+    entry = cache.get(key)
     if entry and (time.time() - entry["ts"]) < _CACHE_TTL_S:
-        _QUERY_CACHE.move_to_end(key)
+        cache.move_to_end(key)
         return entry["value"]
     if entry:
-        _QUERY_CACHE.pop(key, None)
+        cache.pop(key, None)
     return None
 
 def _cache_put(question: str, value: Dict) -> None:
-    key = _cache_key(question)
-    _QUERY_CACHE[key] = {"ts": time.time(), "value": value}
-    _QUERY_CACHE.move_to_end(key)
-    while len(_QUERY_CACHE) > _CACHE_MAX:
-        _QUERY_CACHE.popitem(last=False)
+    cache = _get_cache()
+    key   = _cache_key(question)
+    cache[key] = {"ts": time.time(), "value": value}
+    cache.move_to_end(key)
+    while len(cache) > _CACHE_MAX:
+        cache.popitem(last=False)
 
 
 # ── LLM singleton cache (avoid re-init on every request) ─────────────────────
