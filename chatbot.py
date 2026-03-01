@@ -528,11 +528,21 @@ if st.session_state.auth_user is None:
     # centered narrow card layout
     _, card_col, _ = st.columns([1, 1.4, 1])
     with card_col:
+        _logo_path = ROOT / "frontend" / "image (1).png"
+        if _logo_path.exists():
+            import base64
+            with open(str(_logo_path), "rb") as _f:
+                _logo_b64 = base64.b64encode(_f.read()).decode()
+            st.markdown(
+                f"<div style='display:flex; justify-content:center; margin-bottom:12px;'>"
+                f"<img src='data:image/png;base64,{_logo_b64}' "
+                f"style='width:100px; height:100px; border-radius:50%; object-fit:cover; "
+                f"box-shadow:0 4px 16px rgba(0,0,0,0.18);'/>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
         st.markdown(
-            "<div style='text-align:center; margin-bottom: 8px;'>"
-            "<span style='font-size:2.4rem;'>🤖</span>"
-            "</div>"
-            "<h2 style='text-align:center; margin-top:0; margin-bottom:4px;'>Within Earth Chatbot</h2>"
+            "<h2 style='text-align:center; margin-top:4px; margin-bottom:4px;'>Within Earth Chatbot</h2>"
             "<p style='text-align:center; color:#888; margin-bottom:20px;'>Sign in to continue</p>",
             unsafe_allow_html=True,
         )
@@ -609,7 +619,23 @@ h_left, h_mid, h_right = st.columns([5, 1, 4])
 
 with h_left:
     status_icon = "🟢" if st.session_state.connected else "🔴"
-    st.markdown(f"## 🤖 Text-to-SQL Chatbot &nbsp; {status_icon}")
+    _logo_path = ROOT / "frontend" / "image (1).png"
+    if _logo_path.exists():
+        import base64 as _b64
+        with open(str(_logo_path), "rb") as _f:
+            _hdr_b64 = _b64.b64encode(_f.read()).decode()
+        st.markdown(
+            f"<div style='display:flex; align-items:center; gap:12px;'>"
+            f"<img src='data:image/png;base64,{_hdr_b64}' "
+            f"style='width:48px; height:48px; border-radius:50%; object-fit:cover; "
+            f"box-shadow:0 2px 8px rgba(0,0,0,0.15); flex-shrink:0;'/>"
+            f"<span style='font-size:1.5rem; font-weight:700; line-height:1.2;'>"
+            f"Within Earth Chatbot &nbsp;{status_icon}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(f"## Within Earth Chatbot &nbsp; {status_icon}")
 
 with h_mid:
     st.write("")  # vertical spacer
