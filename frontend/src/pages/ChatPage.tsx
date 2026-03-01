@@ -47,7 +47,7 @@ const DEFAULT_DB_SETTINGS = {
   password: 'pass@readerWE#2026',
   database: 'mis_report_data',
   llm_provider: 'openai',
-  api_key: '',
+  api_key: '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',
   model: 'gpt-4o-mini',
   temperature: 0,
   query_timeout: 60,

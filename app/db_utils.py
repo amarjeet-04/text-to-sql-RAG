@@ -29,6 +29,9 @@ import threading
 
 logger = logging.getLogger("db_utils")
 
+DEFAULT_DB_POOL_SIZE = max(1, int(os.getenv("DB_POOL_SIZE", "5")))
+DEFAULT_DB_MAX_OVERFLOW = max(0, int(os.getenv("DB_MAX_OVERFLOW", "10")))
+
 
 # Global engine cache with TTL
 _ENGINE_CACHE: Dict[str, Engine] = {}
@@ -151,8 +154,8 @@ def create_engine_with_timeout(config: DatabaseConfig) -> Engine:
         config.connection_uri,
         pool_pre_ping=True,  # Verify connections before use
         pool_recycle=300,    # Recycle connections every 5 minutes (remote DBs drop idle connections)
-        pool_size=5,
-        max_overflow=10,
+        pool_size=DEFAULT_DB_POOL_SIZE,
+        max_overflow=DEFAULT_DB_MAX_OVERFLOW,
         # SQL Server specific optimizations
         isolation_level="READ UNCOMMITTED",  # Reduce locking contention
         echo=False,  # Disable SQL logging for performance

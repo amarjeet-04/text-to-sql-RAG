@@ -3315,6 +3315,82 @@ def _ensure_bookingdata_bounded_date_range(sql: str, question: str = "") -> str:
     return _inject_condition_into_sql(sql, " AND ".join(conditions))
 
 
+def _question_requests_chain_country_destination_country(question: str) -> bool:
+    q = " ".join((question or "").lower().split())
+    if "country" not in q or "chain" not in q:
+        return False
+    explicit_hotel_country_terms = (
+        "hotel country",
+        "property country",
+        "hotel location country",
+        "hotel's country",
+        "chain country",
+    )
+    return not any(term in q for term in explicit_hotel_country_terms)
+
+
+def _rewrite_chain_country_to_destination_country(sql: str, question: str = "") -> str:
+    """For chain+country questions, resolve Country via Master_Country.
+
+    The business rules define plain "country" as destination country from
+    Master_Country via BookingData.ProductCountryid. This corrects SQL that
+    incorrectly uses Hotelchain.Country when the question asks for chain and country.
+    """
+    if not sql or not _question_requests_chain_country_destination_country(question):
+        return sql
+
+    booking_alias_match = re.search(
+        r"(?i)\bFROM\s+(?:\[?dbo\]?\.)?\[?BookingData\]?\s+(\w+)\b",
+        sql,
+    )
+    booking_alias = booking_alias_match.group(1) if booking_alias_match else "BD"
+
+    chain_aliases = {
+        m.group(1)
+        for m in re.finditer(r"(?i)\b([A-Za-z_][A-Za-z0-9_]*)\.\[?Chain\]?\b", sql)
+    }
+    if not chain_aliases:
+        return sql
+
+    alias_to_replace = None
+    for alias in chain_aliases:
+        if re.search(rf"(?i)\b{re.escape(alias)}\.\[?Country\]?\b", sql):
+            alias_to_replace = alias
+            break
+    if not alias_to_replace:
+        return sql
+
+    rewritten = re.sub(
+        rf"(?i)\b{re.escape(alias_to_replace)}\.\[?Country\]?\b",
+        "MC_DEST.Country",
+        sql,
+    )
+    if rewritten == sql:
+        return sql
+
+    join_exists = re.search(
+        r"(?i)\bJOIN\s+(?:\[?dbo\]?\.)?\[?Master_Country\]?\s+MC_DEST\b",
+        rewritten,
+    )
+    if join_exists:
+        return rewritten
+
+    join_sql = f"LEFT JOIN dbo.Master_Country MC_DEST ON MC_DEST.CountryID = {booking_alias}.ProductCountryid"
+    insert_match = re.search(
+        r"(?i)\bWHERE\b|\bGROUP\s+BY\b|\bORDER\s+BY\b|\bHAVING\b",
+        rewritten,
+    )
+    if insert_match:
+        return (
+            rewritten[:insert_match.start()].rstrip()
+            + "\n"
+            + join_sql
+            + "\n"
+            + rewritten[insert_match.start():]
+        )
+    return rewritten.rstrip().rstrip(";") + "\n" + join_sql
+
+
 def _rewrite_format_to_monthstart(sql: str, question: str = "") -> str:
     if not sql:
         return sql
@@ -3407,6 +3483,11 @@ def performance_guardrails(
     guarded = _remove_distinct_from_agentmaster(guarded)
     if guarded != before:
         applied.append("remove_distinct_agentmaster")
+
+    before = guarded
+    guarded = _rewrite_chain_country_to_destination_country(guarded, question=question)
+    if guarded != before:
+        applied.append("rewrite_chain_country_to_destination_country")
 
     # Rule 1: default date window for large fact-like sources when missing date filter.
     # Skip if the query already filters by a specific entity (agent/supplier/hotel name),
@@ -5087,11 +5168,16 @@ def initialize_connection(
     # doesn't outlive the timeout gate and leak idle sockets.
     _http_timeout = max(20, LLM_SQL_TIMEOUT_MS / 1000 + 5)
 
-    os.environ["OPENAI_API_KEY"] = api_key
+    if api_key:
+        os.environ["OPENAI_API_KEY"] = api_key
+    effective_api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
+    # Bust the ChatOpenAI singleton cache so the new key takes effect
+    with _CACHED_CHAT_OPENAI_LOCK:
+        _CACHED_CHAT_OPENAI.clear()
     llm = ChatOpenAI(
         model=model,
         temperature=0,
-        openai_api_key=api_key,
+        openai_api_key=effective_api_key,
         request_timeout=_http_timeout,
         max_retries=0,
     )
@@ -5400,6 +5486,13 @@ def _extract_key_guidance_rules(stored_guidance: str) -> str:
         if "canonical joins" in section:
             if line.startswith("•"):
                 kept.append(line)
+            continue
+        low = line.lower()
+        if "master_country.country" in low or "destination country" in low:
+            kept.append(line)
+            continue
+        if "question asks for both chain and country" in low:
+            kept.append(line)
             continue
 
     if not kept:

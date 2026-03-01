@@ -63,6 +63,10 @@ LEFT JOIN dbo.suppliermaster_Report SM ON BD.SupplierId = SM.EmployeeId
 • "hotel" / "property" → Hotelchain.HotelName
 • "country" → Master_Country.Country  (destination country)
 • "city" → Master_City.City
+• When a question mentions both hotel chain and country:
+  - Chain MUST come from Hotelchain (via BD.ProductId = HC.HotelId)
+  - Country MUST come from Master_Country.Country via BD.ProductCountryid
+  - Do NOT use Hotelchain.Country unless the user explicitly asks for hotel country / property country / hotel location country
 • NEVER map "client" to BD.ClientNatinality, BD.Nationality, or any nationality column.
 
 ### AGENT DIMENSION RULES
@@ -98,6 +102,11 @@ LEFT JOIN dbo.suppliermaster_Report SM ON BD.SupplierId = SM.EmployeeId
 • The ONLY allowed hotel join is:
   LEFT JOIN dbo.Hotelchain HC ON BD.ProductId = HC.HotelId
 • Columns: HC.HotelName, HC.Country, HC.City, HC.Star
+• Plain "country" still means destination country from Master_Country, not HC.Country.
+• If the question asks for both chain and country, join both:
+  LEFT JOIN dbo.Hotelchain HC ON BD.ProductId = HC.HotelId
+  LEFT JOIN dbo.Master_Country MC ON BD.ProductCountryid = MC.CountryID
+  Use HC only for Chain and MC.Country for Country.
 • Chain bucket:
   CASE
     WHEN HC.chain IS NULL THEN 'No Chain Hotels'
@@ -153,4 +162,3 @@ LEFT JOIN dbo.suppliermaster_Report SM ON BD.SupplierId = SM.EmployeeId
   - Use '%term%' ONLY if user explicitly asks: contains / match anywhere / partial anywhere / includes / similar
 • If term contains a single quote, escape it (SQL): replace ' with ''
 • Optional (only if your DB collation is case-sensitive): LOWER(col) LIKE 'term%'
-

@@ -137,3 +137,33 @@ def test_validate_sql_candidate_accepts_profit_projection_for_profit_question():
 
     assert is_valid is True
     assert message is None or isinstance(message, str)
+
+
+def test_performance_guardrails_rewrite_chain_country_to_destination_country():
+    sql = """
+    WITH HC AS (
+      SELECT HotelId, HotelName, Country,
+        CASE
+          WHEN chain IS NULL THEN 'No Chain Hotels'
+          ELSE chain
+        END AS Chain
+      FROM HotelChain
+    )
+    SELECT HC.Chain, HC.Country, SUM(COALESCE(BD.AgentBuyingPrice,0)) AS TotalSales
+    FROM BookingData BD
+    LEFT JOIN HC ON BD.ProductId = HC.HotelId
+    WHERE BD.BookingStatus NOT IN ('Cancelled','Not Confirmed','On Request')
+      AND BD.CreatedDate >= '2025-12-01'
+      AND BD.CreatedDate < '2026-03-01'
+    GROUP BY HC.Chain, HC.Country
+    """
+
+    guarded = sql_engine.performance_guardrails(
+        sql,
+        question="Compare revenue by hotel chain and country for last 3 months",
+        dialect="sqlserver",
+    )
+
+    assert "LEFT JOIN dbo.Master_Country MC_DEST ON MC_DEST.CountryID = BD.ProductCountryid" in guarded
+    assert "SELECT HC.Chain, MC_DEST.Country, SUM(COALESCE(BD.AgentBuyingPrice,0)) AS TotalSales" in guarded
+    assert "GROUP BY HC.Chain, MC_DEST.Country" in guarded
