@@ -159,12 +159,20 @@ def create_engine_with_timeout(config: DatabaseConfig) -> Engine:
         echo_pool=False,  # Disable pool logging for performance
     )
 
+    # Apply session-level settings on EVERY new connection from the pool,
+    # including LangChain's internal INFORMATION_SCHEMA introspection queries.
+    @event.listens_for(engine, "connect")
+    def _set_session_options(dbapi_conn, connection_record):
+        cursor = dbapi_conn.cursor()
+        try:
+            cursor.execute("SET DEADLOCK_PRIORITY LOW")
+            cursor.execute("SET LOCK_TIMEOUT 8000")   # 8 s — covers slow metadata queries
+        finally:
+            cursor.close()
+
     # Warm up the connection pool — first query is faster
     try:
         with engine.connect() as conn:
-            # Set SQL Server specific session options for performance
-            conn.execute(text("SET DEADLOCK_PRIORITY LOW"))
-            conn.execute(text("SET LOCK_TIMEOUT 5000"))  # 5 second lock timeout
             conn.execute(text("SELECT 1"))
         # Cache the engine after successful warmup
         _set_cached_engine(config.connection_uri, engine)

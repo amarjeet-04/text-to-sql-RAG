@@ -38,6 +38,17 @@ LEFT JOIN dbo.suppliermaster_Report SM ON BD.SupplierId = SM.EmployeeId
 • If the user does NOT mention any time period, do NOT add a date filter.
 • Only add a date filter when the user explicitly mentions a year, month, period, or uses words like "this year", "last month", "YTD", "2024", etc.
 
+### FOLLOW-UP QUERY RULES
+• A follow-up question is one that uses words like "more", "that", "those", "it", "also",
+  or references a specific name/value from a previous answer (e.g. "give me more about Agoda").
+• When the question is a follow-up:
+  - Copy the EXACT date filter (CreatedDate >= / <) from the previous SQL in HISTORY as-is.
+  - Do NOT replace it with the current month, current year, or any default window.
+  - Do NOT add any new date filter if the previous SQL had none.
+  - Only add or change the date filter if the user explicitly states a new time period.
+• When the question is self-contained (has its own year, month, or date range):
+  - Ignore HISTORY and build the date filter fresh from the user's request.
+
 ### DUPLICATE PREVENTION
 • Lookup tables may contain duplicates.
 • Use DISTINCT mapping if needed:
@@ -65,6 +76,14 @@ LEFT JOIN dbo.suppliermaster_Report SM ON BD.SupplierId = SM.EmployeeId
     AgentType = ATM.agenttype
   - Special override: if A.AgentCode = 'WEGR' then AgentType = 'We Groups'
   - Else AgentType = COALESCE(ATM.agenttype,'Unknown')
+"• AgentType MUST be calculated using this CASE logic:\n"
+"\n"
+"CASE\n"
+" WHEN A.AgentCode = 'WEGR' THEN 'We Groups'\n"
+" WHEN ATM.AgentType = 'API' THEN 'API'\n"
+" ELSE 'B2B Retail'\n"
+"END AS AgentType\n"
+"\n"
 • Never select BD.AgentId in final output.
 
 ### SUPPLIER DIMENSION RULES

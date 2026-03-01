@@ -732,6 +732,7 @@ From the SCHEMA and RELEVANT TABLES above, identify:
 ### Step 3 — Materialise the date range
 Using the IST reference date above, convert the time window from Step 1c to concrete WHERE boundaries.
 Write this as plain text only (NOT inside a SQL code block):
+  
   Forbidden in WHERE predicates: YEAR(), MONTH(), CAST(col AS DATE), FORMAT()
   If no date window is mentioned, do not add one — explicitly state "no date filter applied"
   IMPORTANT: This step is analysis only. The actual SQL goes ONLY in the ```sql``` block in Step 6.
@@ -851,6 +852,7 @@ Do NOT invent or abbreviate any name not present in the schema.
 
 ### Step 4 — Resolve dates (if applicable)
 If the failure was date-related, convert the time window to SARGable form as plain text:
+  
   Forbidden in WHERE predicates: YEAR(), MONTH(), CAST(col AS DATE), FORMAT()
   IMPORTANT: Write only analysis here. The actual SQL goes ONLY in the ```sql``` block in Step 5.
 Otherwise skip this step and write "date filter not relevant".
@@ -1896,156 +1898,9 @@ def is_filter_modification_followup(question: str, previous_result_df=None) -> b
     return False
 
 
-def _infer_dimension_from_sql(sql: str) -> Optional[str]:
-    sql_lower = (sql or "").lower()
-    if "suppliermaster_report" in sql_lower or "suppliername" in sql_lower:
-        return "supplier"
-    if "agentmaster_v1" in sql_lower or "agentname" in sql_lower:
-        return "agent"
-    if "master_country" in sql_lower or re.search(r"(?i)\bcountry\b", sql or ""):
-        return "country"
-    if "master_city" in sql_lower or re.search(r"(?i)\bcity\b", sql or ""):
-        return "city"
-    return None
-
-
-def _extract_followup_entity_candidate(question: str) -> Optional[str]:
-    text = " ".join((question or "").strip().rstrip("?").rstrip(".").split())
-    if not text:
-        return None
-
-    patterns = (
-        r"(?i)^give me more info about\s+",
-        r"(?i)^give me more information about\s+",
-        r"(?i)^tell me more about\s+",
-        r"(?i)^more info about\s+",
-        r"(?i)^more information about\s+",
-        r"(?i)^details about\s+",
-        r"(?i)^more about\s+",
-        r"(?i)^what is the cancellation rate for\s+",
-        r"(?i)^what are the cancellations for\s+",
-        r"(?i)^show monthly booking trend for\s+",
-        r"(?i)^show trend for\s+",
-        r"(?i)^show me\s+",
-        r"(?i)^show\s+",
-        r"(?i)^what about\s+",
-        r"(?i)^how about\s+",
-    )
-    for pattern in patterns:
-        new_text = re.sub(pattern, "", text).strip()
-        if new_text != text:
-            text = new_text
-            break
-
-    text = re.sub(r"(?i)\b(this year|this month|last month|last year|today|yesterday)\b", "", text).strip()
-    text = re.sub(r"\s+", " ", text).strip(" ,.-")
-    if len(text) < 3:
-        return None
-    return text
-
-
-_FOLLOWUP_DIMENSION_SEARCH = {
-    "agent": {
-        "table": "AgentMaster_V1",
-        "name_col": "AgentName",
-    },
-    "supplier": {
-        "table": "suppliermaster_Report",
-        "name_col": "SupplierName",
-    },
-    "country": {
-        "table": "Master_Country",
-        "name_col": "Country",
-    },
-    "city": {
-        "table": "Master_City",
-        "name_col": "City",
-    },
-}
-
-
-def _infer_followup_dimension_override(
-    question: str,
-    previous_sql: str,
-    previous_result_df,
-    db: Optional[SQLDatabase],
-) -> Optional[Dict[str, str]]:
-    candidate = _extract_followup_entity_candidate(question)
-    if not candidate or db is None:
-        return None
-
-    prev_dimension = _infer_dimension_from_sql(previous_sql)
-    if previous_result_df is not None and len(previous_result_df) > 0:
-        try:
-            if _question_mentions_result_value(candidate.lower(), previous_result_df):
-                return None
-        except Exception:
-            pass
-
-    candidate_sql = candidate.replace("'", "''")
-    best_match = None
-    best_count = 0
-
-    try:
-        with closing(_raw_conn_from_engine(db)) as conn:
-            with closing(conn.cursor()) as cursor:
-                for dimension, cfg in _FOLLOWUP_DIMENSION_SEARCH.items():
-                    table_name = cfg["table"]
-                    if not _table_exists_fast(db, table_name):
-                        continue
-                    sql = (
-                        f"SELECT COUNT(1) "
-                        f"FROM [dbo].[{table_name}] WITH (NOLOCK) "
-                        f"WHERE [{cfg['name_col']}] LIKE ?"
-                    )
-                    try:
-                        cursor.execute(sql, (f"%{candidate_sql}%",))
-                        row = cursor.fetchone()
-                        match_count = int(row[0]) if row and row[0] is not None else 0
-                    except Exception:
-                        match_count = 0
-                    if match_count > best_count:
-                        best_count = match_count
-                        best_match = {
-                            "dimension": dimension,
-                            "name_col": cfg["name_col"],
-                            "table": table_name,
-                            "candidate": candidate,
-                        }
-    except Exception:
-        return None
-
-    if not best_match or best_count <= 0:
-        return None
-    if prev_dimension == best_match["dimension"]:
-        return None
-    return best_match
-
-
-def _is_detail_drilldown_request(question: str) -> bool:
-    q = (question or "").lower()
-    phrases = (
-        "more info",
-        "more information",
-        "tell me more",
-        "more about",
-        "details about",
-        "give me details",
-        "give me more info",
-    )
-    return any(p in q for p in phrases)
-
-
 # --- SQL modification ---
 
-def modify_sql_for_filter(
-    original_sql: str,
-    filter_request: str,
-    llm,
-    db: Optional[SQLDatabase] = None,
-    stored_guidance: str = "",
-    followup_override: Optional[Dict[str, str]] = None,
-) -> str:
+def modify_sql_for_filter(original_sql: str, filter_request: str, llm, db: Optional[SQLDatabase] = None) -> str:
     table_name = _extract_from_table_name(original_sql) or ""
     available_cols = ""
     if db is not None and table_name:
@@ -2057,28 +1912,6 @@ def modify_sql_for_filter(
     if available_cols:
         column_hint = f"\nIMPORTANT: The table '{table_name}' only has these columns: {available_cols}\nDo NOT use columns that are not in this list."
 
-    allow_shape_change = bool(followup_override) or _is_detail_drilldown_request(filter_request)
-    structure_rule = (
-        "- KEEP the same SELECT columns, GROUP BY, ORDER BY structure"
-        if not allow_shape_change
-        else "- Preserve the previous metric intent and date/status filters, but you MAY change SELECT columns, GROUP BY, and JOINs when needed to answer the follow-up correctly"
-    )
-    from_rule = (
-        "- KEEP the same FROM table — do NOT switch to a different table/view"
-        if not followup_override
-        else "- KEEP BookingData as the base table, but you MAY switch the lookup JOIN/dimension if the new named entity belongs to a different business dimension"
-    )
-    override_hint = ""
-    if followup_override:
-        override_hint = (
-            f"\nIMPORTANT FOLLOW-UP OVERRIDE:\n"
-            f"- Previous query dimension appears to be different from the new entity.\n"
-            f"- The user entity '{followup_override['candidate']}' matched dimension '{followup_override['dimension']}' "
-            f"using {followup_override['table']}.{followup_override['name_col']}.\n"
-            f"- Do NOT force this entity into the previous dimension.\n"
-            f"- Preserve the prior metric/date intent, but switch to the correct dimension join/filter if needed.\n"
-        )
-
     prompt = f"""You are a SQL expert. The user previously ran this query:
 
 Previous SQL: {original_sql}
@@ -2089,9 +1922,8 @@ Modify the SQL to satisfy the user's request. Keep the same table/view and SELEC
 
 Rules:
 - Output ONLY the modified SQL, nothing else
-- Use BookingData as the base fact table
-{from_rule}
-{structure_rule}
+- KEEP the same FROM table — do NOT switch to a different table/view
+- KEEP the same SELECT columns, GROUP BY, ORDER BY structure
 - Only ADD or MODIFY the WHERE clause to filter results
 - Name/text column matching: use LIKE 'value%' (prefix match) for business names
   such as agent name, supplier name, country, city, hotel, chain — never use exact '=' for these
@@ -2099,16 +1931,10 @@ Rules:
   Use LIKE '%value%' ONLY if the user explicitly says "contains", "includes", "anywhere", or "similar".
 - If filtering to a single entity (one agent, one country, etc.), REMOVE any TOP N / LIMIT clause
   so the full result for that entity is shown
-- For requests like "more info", "more information", "tell me more", or "details",
-  provide a useful drill-down instead of just repeating the exact same aggregation if the current query is too shallow
 - Keep date filters SARGable:
   - Use range predicates: date_col >= 'YYYY-MM-DD' AND date_col < 'YYYY-MM-DD'
   - Do NOT use YEAR(date_col), MONTH(date_col), or CAST(date_col AS DATE) in WHERE
 - ONLY use columns that exist in the table being queried{column_hint}
-{override_hint}
-
-DOMAIN BUSINESS RULES:
-{stored_guidance or "No stored procedure guidance available."}
 
 Modified SQL:"""
 
@@ -2125,7 +1951,7 @@ Modified SQL:"""
         return original_sql
 
 
-def modify_sql_for_sort(original_sql: str, sort_request: str, llm, stored_guidance: str = "") -> str:
+def modify_sql_for_sort(original_sql: str, sort_request: str, llm) -> str:
     sql_no_order = re.sub(r"\s+ORDER\s+BY\s+[^;]+", "", original_sql, flags=re.IGNORECASE)
     req_lower = sort_request.lower()
 
@@ -2146,8 +1972,6 @@ def modify_sql_for_sort(original_sql: str, sort_request: str, llm, stored_guidan
     else:
         prompt = f"""SQL: {original_sql}
 User wants: {sort_request}
-DOMAIN BUSINESS RULES:
-{stored_guidance or "No stored procedure guidance available."}
 Output ONLY the ORDER BY clause (e.g., "ORDER BY column DESC"). No other text:"""
         try:
             resp = llm.invoke(prompt)
@@ -2488,127 +2312,6 @@ def _default_validator_result(
     return out
 
 
-def _extract_requested_metric_intents(question: str) -> List[str]:
-    q = (question or "").strip().lower()
-    if not q:
-        return []
-
-    intents: List[str] = []
-    checks = [
-        ("avg_booking_value", ("average booking value", "avg booking value", "average value per booking")),
-        ("avg_booking_window", ("average booking window", "avg booking window", "lead time", "booking window")),
-        ("room_nights", ("room nights", "room night", "night count", "total nights")),
-        ("profit", ("profit",)),
-        ("revenue", ("revenue", "sales", "total sales", "total revenue")),
-        ("cost", ("cost", "expense", "spend")),
-        ("bookings", ("booking count", "total bookings", "number of bookings", "bookings")),
-        ("cancellations", ("cancelled bookings", "cancellation rate", "cancellations", "cancelled")),
-    ]
-    for metric, phrases in checks:
-        if any(phrase in q for phrase in phrases):
-            intents.append(metric)
-
-    seen = set()
-    deduped: List[str] = []
-    for metric in intents:
-        if metric not in seen:
-            seen.add(metric)
-            deduped.append(metric)
-    return deduped
-
-
-def _extract_outer_select_segment(sql: str) -> str:
-    if not sql:
-        return ""
-    sql_upper = sql.upper()
-    last_select = sql_upper.rfind("SELECT")
-    if last_select == -1:
-        return sql
-    select_segment = sql[last_select:]
-    from_match = re.search(r"\bFROM\b", select_segment, re.IGNORECASE)
-    if from_match:
-        select_segment = select_segment[:from_match.start()]
-    return select_segment
-
-
-def _extract_projected_metric_intents(sql: str) -> List[str]:
-    segment = _extract_outer_select_segment(sql)
-    if not segment:
-        return []
-
-    text = " ".join(segment.lower().replace("[", " ").replace("]", " ").split())
-    intents: List[str] = []
-
-    if (
-        "room nights" in text
-        or "totalroomnights" in text
-        or re.search(r"datediff\s*\(\s*day\s*,.*checkindate.*checkoutdate", text, flags=re.IGNORECASE)
-    ):
-        intents.append("room_nights")
-    if (
-        "avg booking window" in text
-        or "average booking window" in text
-        or "lead time" in text
-        or re.search(r"avg\s*\(\s*cast\s*\(\s*datediff\s*\(\s*day\s*,.*createddate.*checkindate", text, flags=re.IGNORECASE)
-    ):
-        intents.append("avg_booking_window")
-    if "avg booking value" in text or "average booking value" in text:
-        intents.append("avg_booking_value")
-    if "profit" in text or re.search(r"agentbuyingprice.*-\s*.*companybuyingprice", text, flags=re.IGNORECASE):
-        intents.append("profit")
-    if "revenue" in text or "sales" in text:
-        intents.append("revenue")
-    if "cost" in text or "expense" in text or "spend" in text:
-        intents.append("cost")
-    if "booking" in text or re.search(r"count\s*\(\s*distinct\s+.*pnrno", text, flags=re.IGNORECASE):
-        intents.append("bookings")
-    if "cancel" in text:
-        intents.append("cancellations")
-
-    seen = set()
-    deduped: List[str] = []
-    for metric in intents:
-        if metric not in seen:
-            seen.add(metric)
-            deduped.append(metric)
-    return deduped
-
-
-def _validate_metric_intent_match(question: str, sql: str) -> Dict[str, Any]:
-    expected = _extract_requested_metric_intents(question)
-    projected = _extract_projected_metric_intents(sql)
-
-    if not expected or not projected:
-        return _default_validator_result(ok_to_execute=True, failure_type="intent_mismatch", reasons=[], fixed_sql=None, needs_retry=False)
-
-    missing = [metric for metric in expected if metric not in projected]
-    if not missing:
-        return _default_validator_result(ok_to_execute=True, failure_type="intent_mismatch", reasons=[], fixed_sql=None, needs_retry=False)
-
-    return _default_validator_result(
-        ok_to_execute=False,
-        failure_type="intent_mismatch",
-        reasons=[
-            "metric_intent_mismatch: "
-            f"question expects {', '.join(expected)} but SQL projects {', '.join(projected)}"
-        ],
-        fixed_sql=None,
-        needs_retry=True,
-    )
-
-
-def _validate_sql_candidate(question: str, sql: str) -> Tuple[bool, Optional[str]]:
-    valid, message = validate_sql(sql)
-    if not valid:
-        return valid, message
-
-    metric_check = _validate_metric_intent_match(question, sql)
-    if not metric_check.get("ok_to_execute", False):
-        reasons = metric_check.get("reasons") or []
-        return False, "; ".join(reasons) if reasons else "metric_intent_mismatch"
-    return True, message
-
-
 def _parse_validator_output(raw_text: str) -> Dict[str, Any]:
     txt = (raw_text or "").strip()
     if not txt:
@@ -2661,10 +2364,6 @@ def run_sql_intent_validator(
     timeout_ms: int = 1800,
 ) -> Dict[str, Any]:
     """Validate SQL against syntax/schema/intent/performance via strict JSON prompt."""
-    local_check = _validate_metric_intent_match(question, sql)
-    if not local_check.get("ok_to_execute", False):
-        return local_check
-
     if llm is None:
         valid, msg = validate_sql(sql)
         if valid:
@@ -6011,8 +5710,8 @@ def handle_query(
     def _load_stored_proc_guidance():
         return _get_full_stored_procedure_guidance()
 
-    # Always load domain guidance so follow-up rewrites use the same stored-procedure rules.
-    stored_procedure_guidance = _load_stored_proc_guidance()
+    # Lazy-loaded inside the LLM-generation path (elif cleaned_query is None).
+    # Cache hits, deterministic topN/overview, and sort/filter follow-ups never pay this cost.
 
     # Step 3: Check for sort/filter follow-up
     previous_sql = _get_last_sql(chat_history) or session_state.get("last_sql")
@@ -6044,32 +5743,18 @@ def handle_query(
     )
 
     is_followup_filter = False
-    followup_override = (
-        _infer_followup_dimension_override(question, previous_sql, previous_result_df, db)
-        if is_filter_mod and previous_sql
-        else None
-    )
     if is_sort_request:
-        cleaned_query = modify_sql_for_sort(
-            previous_sql,
-            question,
-            llm,
-            stored_guidance=stored_procedure_guidance,
-        )
+        cleaned_query = modify_sql_for_sort(previous_sql, question, llm)
         is_valid = True
     elif is_filter_mod:
-        cleaned_query = modify_sql_for_filter(
-            previous_sql,
-            question,
-            llm,
-            db=db,
-            stored_guidance=stored_procedure_guidance,
-            followup_override=followup_override,
-        )
+        cleaned_query = modify_sql_for_filter(previous_sql, question, llm, db=db)
         is_valid = True
         is_followup_filter = True
     elif cleaned_query is None:
+        # Lazy-load schema + stored-proc guidance only on the LLM-generation path.
+        # Cache hits, deterministic builders, and sort/filter follow-ups exit before here.
         full_schema_text = _load_schema()
+        stored_procedure_guidance = _load_stored_proc_guidance()
 
         ### FAST PATH: skip cache lookups for follow-up/time-sensitive prompts.
         is_followup = is_followup_question(question)
@@ -6251,7 +5936,7 @@ def handle_query(
                 if not fallback_sql:
                     return False
                 cleaned_query = fix_common_sql_errors(fallback_sql, dialect=active_dialect)
-                is_valid, validation_msg = _validate_sql_candidate(question, cleaned_query)
+                is_valid, validation_msg = validate_sql(cleaned_query)
                 fallback_used = True
                 fallback_used_request = True
                 fallback_reason = resolved_reason or reason
@@ -6360,7 +6045,7 @@ def handle_query(
             if not fallback_used:
                 cleaned_query = _clean_sql_response(resp_text.strip())
                 cleaned_query = fix_common_sql_errors(cleaned_query, dialect=active_dialect)
-                is_valid, validation_msg = _validate_sql_candidate(question, cleaned_query)
+                is_valid, validation_msg = validate_sql(cleaned_query)
 
                 # Log SQL generation results
                 log_event(logger, logging.INFO, "sql_generation_complete",
@@ -6395,14 +6080,13 @@ def handle_query(
                         fixed_sql = validator_result.get("fixed_sql")
                         if isinstance(fixed_sql, str) and fixed_sql.strip():
                             candidate_sql = fix_common_sql_errors(_clean_sql_response(fixed_sql), dialect=active_dialect)
-                            fixed_valid, fixed_msg = _validate_sql_candidate(question, candidate_sql)
+                            fixed_valid, _ = validate_sql(candidate_sql)
                             if fixed_valid:
                                 cleaned_query = candidate_sql
                                 is_valid = True
                                 logger.info("validator_applied_fixed_sql failure_type=%s", validator_result.get("failure_type"))
                             else:
                                 is_valid = False
-                                validation_msg = fixed_msg
                         else:
                             is_valid = False
 
@@ -6442,13 +6126,10 @@ def handle_query(
                     retry_raw = re.sub(r"<think>.*?</think>", "", retry_raw, flags=re.DOTALL).strip()
                     retry_sql = _clean_sql_response(retry_raw)
                     retry_sql = fix_common_sql_errors(retry_sql, dialect=active_dialect)
-                    retry_valid, retry_msg = _validate_sql_candidate(question, retry_sql)
-                    if retry_valid:
+                    if validate_sql(retry_sql)[0]:
                         cleaned_query = retry_sql
                         is_valid = True
                         timer.mark("sql_validation")
-                    else:
-                        validation_msg = retry_msg
                 except Exception:
                     logger.warning("SQL retry with stricter prompt failed", exc_info=True)
 
@@ -6491,12 +6172,9 @@ def handle_query(
                             fix_sql = fix_resp.content.strip() if hasattr(fix_resp, "content") else str(fix_resp).strip()
                             fix_sql = _clean_sql_response(fix_sql)
                             fix_sql = fix_common_sql_errors(fix_sql, dialect=active_dialect)
-                            fix_valid, fix_msg = _validate_sql_candidate(question, fix_sql)
-                            if fix_valid:
+                            if validate_sql(fix_sql)[0]:
                                 cleaned_query = fix_sql
                                 timer.mark("sql_validation")
-                            else:
-                                validation_msg = fix_msg
                         except Exception:
                             logger.warning("ID-column LLM fix failed, keeping original", exc_info=True)
 

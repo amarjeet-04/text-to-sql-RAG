@@ -15,7 +15,14 @@ from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from backend.services.session import Session, SessionState, ConversationTurn, QueryCacheStore
+from backend.services.session import (
+    ConversationTurn,
+    FOLLOWUP_WINDOW_TURNS,
+    QueryCacheStore,
+    Session,
+    SessionState,
+    append_with_sliding_window,
+)
 from backend.services.sql_engine import (
     handle_query as legacy_handle_query,
     generate_nl_response,
@@ -422,21 +429,27 @@ async def query(req: QueryRequest, request: Request, session: Session = Depends(
             us = result.get("updated_state")
             if us:
                 ss = session.session_state
-                ss.last_sql         = us.get("last_sql",         ss.last_sql)
-                ss.last_table       = us.get("last_table",       ss.last_table)
-                ss.last_date_col    = us.get("last_date_col",    ss.last_date_col)
-                ss.last_time_window = us.get("last_time_window", ss.last_time_window)
-                ss.last_dimensions  = us.get("last_dimensions",  ss.last_dimensions)
-                ss.last_metrics     = us.get("last_metrics",     ss.last_metrics)
-                ss.last_filters     = us.get("last_filters",     ss.last_filters)
+                # us may be a SessionState object (sql_engine_u) or a dict (sql_engine legacy)
+                _get = us.get if isinstance(us, dict) else lambda k, d=None: getattr(us, k, d)
+                ss.last_sql         = _get("last_sql",         ss.last_sql)
+                ss.last_table       = _get("last_table",       ss.last_table)
+                ss.last_date_col    = _get("last_date_col",    ss.last_date_col)
+                ss.last_time_window = _get("last_time_window", ss.last_time_window)
+                ss.last_dimensions  = _get("last_dimensions",  ss.last_dimensions)
+                ss.last_metrics     = _get("last_metrics",     ss.last_metrics)
+                ss.last_filters     = _get("last_filters",     ss.last_filters)
 
             # Append structured turn
             turn = result.get("conversation_turn")
             if turn is not None:
-                session.conversation_turns.append(turn)
+                append_with_sliding_window(
+                    session.conversation_turns,
+                    turn,
+                    max_items=FOLLOWUP_WINDOW_TURNS,
+                )
 
             # ### MINIMAL CORE — chat history: raw dicts only, no pandas DataFrame
-            session.chat_history.append({
+            append_with_sliding_window(session.chat_history, {
                 "question":   req.question,
                 "sql":        result.get("sql"),
                 "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -447,7 +460,7 @@ async def query(req: QueryRequest, request: Request, session: Session = Depends(
                 "request_id": request_id,
                 # result_rows stored as list-of-dicts for follow-up value detection (no pandas)
                 "result_rows": result.get("results") or [],
-            })
+            }, max_items=FOLLOWUP_WINDOW_TURNS)
 
         has_rows = bool(isinstance(result.get("results"), list) and result.get("results"))
         if bool(result.get("nl_pending")) and has_rows:

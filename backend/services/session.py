@@ -13,6 +13,8 @@ from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
 from datetime import datetime
 
+FOLLOWUP_WINDOW_TURNS = max(1, int(os.getenv("FOLLOWUP_WINDOW_TURNS", "4")))
+
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
@@ -82,14 +84,33 @@ class ConversationTurn:
     timestamp: float         = field(default_factory=time.time)
 
 
-def serialize_conversation_turns(turns: List[ConversationTurn], max_turns: int = 3) -> str:
+def get_recent_items(items: Optional[List[Any]], max_items: int = FOLLOWUP_WINDOW_TURNS) -> List[Any]:
+    """Return only the most recent items for lightweight sliding-window memory."""
+    if not items:
+        return []
+    max_items = max(1, int(max_items))
+    return list(items[-max_items:])
+
+
+def append_with_sliding_window(items: List[Any], item: Any, max_items: int = FOLLOWUP_WINDOW_TURNS) -> None:
+    """Append an item and keep only the most recent entries."""
+    items.append(item)
+    overflow = len(items) - max(1, int(max_items))
+    if overflow > 0:
+        del items[:overflow]
+
+
+def serialize_conversation_turns(
+    turns: List[ConversationTurn],
+    max_turns: int = FOLLOWUP_WINDOW_TURNS,
+) -> str:
     """Compact context string passed into LLM prompt.
     Includes previous Q, answer, and SQL so the model has full context for follow-ups.
     """
     if not turns:
         return "No prior conversation."
     parts = []
-    for t in turns[-max_turns:]:
+    for t in get_recent_items(turns, max_items=max_turns):
         sql_line = ""
         if t.sql:
             snippet = t.sql[:500]
